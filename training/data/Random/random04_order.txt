@@ -1,0 +1,1 @@
+Rest,Pinch,Ring,Middle,Thumb,Index,Fist,Little
