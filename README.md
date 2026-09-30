@@ -56,9 +56,9 @@ flowchart LR
 
 ```
 rehand-emg-prosthesis/
-├─ hardware/                 KiCad 9 프로젝트 (근전도 보드)
-│  ├─ EMG.kicad_sch / .kicad_pcb / .kicad_pro
-│  └─ gerber/                제작용 Gerber + 드릴 파일
+├─ hardware/                 KiCad 프로젝트 (근전도 보드)
+│  ├─ v1/                    초기 보드: 회로도 · PCB · gerber/
+│  └─ v2/                    현재 보드 (배터리 · 버튼 추가): 회로도 · PCB · gerber/
 ├─ collector/                데이터 수집 GUI (PySide6 + pyserial)
 │  └─ emg_collector_v4.py
 ├─ training/                 학습 + ESP32용 C 헤더 생성
@@ -80,14 +80,23 @@ rehand-emg-prosthesis/
 
 ## 하드웨어
 
-<p align="center"><img src="docs/images/pcb.png" width="45%"></p>
+<p align="center">
+  <img src="docs/images/pcb_v1.png" width="42%">
+  <img src="docs/images/pcb_v2.png" width="42%">
+  <br><sub>왼쪽 v1 · 오른쪽 v2 (현재)</sub>
+</p>
 
-회로도: [docs/images/EMG.svg](docs/images/EMG.svg)
+| | v1 | v2 (현재) |
+|---|---|---|
+| 크기 | 28.75 × 40 mm | 33.2 × 40 mm |
+| MCU 실장 | XIAO ESP32-S3 DIP 풋프린트 | XIAO ESP32-S3 **SMD** 풋프린트 (하단 BAT 패드 사용) |
+| 센서 입력 | Molex SPOX 3핀 ×4 (신호 / 3V3 / GND → A0~A3) | 동일 |
+| 전원 | USB | **J5 PicoBlade 2핀** → XIAO BAT 패드 (배터리 연결) |
+| 입력 버튼 | 없음 | **SW1 · SW2** → D8 · D7, 풀업 저항 + 디바운스 커패시터 (0805) |
+| 회로도 | [schematic_v1.svg](docs/images/schematic_v1.svg) | [schematic_v2.svg](docs/images/schematic_v2.svg) |
 
-- **보드**: 28.75 × 40 mm, 2층 PCB (KiCad 9)
-- **구성**: XIAO ESP32-S3 (DIP 풋프린트) + Molex SPOX 3핀 커넥터 4개 (신호 / 전원 / GND)
-- **채널 배치**: J1~J4 → A0~A3, 전완부 굴근·신근 위치에 전극 부착
 - 브레드보드 배선에서 생기던 접촉 불량과 잡음을 줄이기 위해 전용 보드로 제작
+- v2에서는 착용형으로 쓰기 위해 배터리 입력을 추가하고, 모드 전환 등에 쓸 버튼 2개를 하드웨어 풀업·RC 디바운스와 함께 넣음
 
 ---
 
@@ -226,7 +235,7 @@ Arduino IDE 설정: 보드 `XIAO_ESP32S3`, `USB CDC On Boot: Enabled`
 ---
 
 ## 기술 스택
-`Python` `PyTorch` `NumPy/SciPy` `PySide6` · `C/C++ (Arduino, FreeRTOS)` `ESP-NOW` · `KiCad 9`
+`Python` `PyTorch` `NumPy/SciPy` `PySide6` · `C/C++ (Arduino, FreeRTOS)` · `KiCad`
 
 ## 라이선스 / 출처
 - `firmware/esp32_emg_realtime/EMGFilters.*`: OYMotion Inc. (BSD-3-Clause), 채널별 상태 분리 수정
