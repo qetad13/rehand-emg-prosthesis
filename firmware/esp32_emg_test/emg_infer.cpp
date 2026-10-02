@@ -254,35 +254,42 @@ int emg_rest_gate(const float *epoch, int pred) {
 void emg_vote_reset(EmgVote *v) {
   memset(v, 0, sizeof(*v));
   v->output = EMG_REST_CLASS;
+  v->since = 1L << 30;
 }
 
 int emg_vote_update(EmgVote *v, int pred) {
   v->hist[v->pos] = pred;
   v->pos = (v->pos + 1) % EMG_HIST_N;
   if (v->count < EMG_HIST_N) v->count++;
+  v->since++;
 
+  int cand = v->output;
   if (pred == EMG_REST_CLASS) {
-    v->output = EMG_REST_CLASS;  // 끄기는 바로
-    return v->output;
+    v->rest_run++;
+    if (v->rest_run >= EMG_VOTE_RELEASE_N) cand = EMG_REST_CLASS;   // 끄기
+  } else {
+    v->rest_run = 0;
+    const int resting = (v->output == EMG_REST_CLASS);
+    const int n    = resting ? EMG_VOTE_N : EMG_VOTE_SWITCH_K;
+    const int need = resting ? EMG_VOTE_K : EMG_VOTE_SWITCH_K;
+    const int m    = v->count < n ? v->count : n;
+
+    int counts[EMG_NUM_CLASSES];
+    memset(counts, 0, sizeof(counts));
+    for (int i = 0; i < m; ++i) {
+      const int idx = (v->pos - 1 - i + EMG_HIST_N) % EMG_HIST_N;   // 최근 것부터
+      counts[v->hist[idx]]++;
+    }
+    int best = 0;
+    for (int k = 1; k < EMG_NUM_CLASSES; ++k) {
+      if (counts[k] > counts[best]) best = k;
+    }
+    if (counts[best] >= need && best != EMG_REST_CLASS && best != v->output) cand = best;
   }
 
-  const int resting = (v->output == EMG_REST_CLASS);
-  const int n    = resting ? EMG_VOTE_N : EMG_VOTE_SWITCH_K;
-  const int need = resting ? EMG_VOTE_K : EMG_VOTE_SWITCH_K;
-  const int m    = v->count < n ? v->count : n;
-
-  int counts[EMG_NUM_CLASSES];
-  memset(counts, 0, sizeof(counts));
-  for (int i = 0; i < m; ++i) {
-    const int idx = (v->pos - 1 - i + EMG_HIST_N) % EMG_HIST_N;   // 최근 것부터
-    counts[v->hist[idx]]++;
-  }
-  int best = 0;
-  for (int k = 1; k < EMG_NUM_CLASSES; ++k) {
-    if (counts[k] > counts[best]) best = k;
-  }
-  if (counts[best] >= need && best != EMG_REST_CLASS && best != v->output) {
-    v->output = best;
+  if (cand != v->output && v->since >= EMG_VOTE_HOLD_N) {   // 바뀐 지 얼마 안 됐으면 유지
+    v->output = cand;
+    v->since = 0;
   }
   return v->output;
 }

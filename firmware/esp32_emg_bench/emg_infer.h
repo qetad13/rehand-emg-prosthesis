@@ -46,7 +46,8 @@ int emg_rest_gate(const float *epoch, int pred);
 // 4) 최종 출력
 //    휴식 -> 손가락: 최근 EMG_VOTE_N번 중 EMG_VOTE_K번 이상 같아야 켬
 //    손가락 -> 다른 손가락: EMG_VOTE_SWITCH_K번 연속 같아야 바꿈
-//    끄기: 휴식 판단 1번이면 바로
+//    끄기: 휴식 판단이 EMG_VOTE_RELEASE_N번 연속이면
+//    출력이 바뀐 뒤 EMG_VOTE_HOLD_N번 판단 동안은 다시 안 바꿈 (깜빡임 방지)
 // ---------------------------------------------------------------
 #define EMG_HIST_N (EMG_VOTE_N > EMG_VOTE_SWITCH_K ? EMG_VOTE_N : EMG_VOTE_SWITCH_K)
 typedef struct {
@@ -54,6 +55,8 @@ typedef struct {
   int count;
   int pos;
   int output;
+  int rest_run;     // 연속된 휴식 판단 수
+  long since;       // 마지막으로 출력이 바뀐 뒤 지난 판단 수
 } EmgVote;
 
 void emg_vote_reset(EmgVote *v);

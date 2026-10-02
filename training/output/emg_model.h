@@ -24,6 +24,8 @@
 #define EMG_VOTE_K        2
 #define EMG_VOTE_SWITCH_K 2
 #define EMG_REST_GATE     0.000f
+#define EMG_VOTE_RELEASE_N 1
+#define EMG_VOTE_HOLD_N   0
 #define EMG_REST_CLASS    0
 
 // 모델이 쓰는 채널 (CSV의 Ch 번호 = 보드의 EMG_PINS 순서)

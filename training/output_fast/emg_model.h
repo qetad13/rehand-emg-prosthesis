@@ -22,8 +22,10 @@
 #define EMG_BUF_SIZE      1456
 #define EMG_VOTE_N        3
 #define EMG_VOTE_K        3
-#define EMG_VOTE_SWITCH_K 5
+#define EMG_VOTE_SWITCH_K 8
 #define EMG_REST_GATE     2.000f
+#define EMG_VOTE_RELEASE_N 3
+#define EMG_VOTE_HOLD_N   10
 #define EMG_REST_CLASS    0
 
 // 모델이 쓰는 채널 (CSV의 Ch 번호 = 보드의 EMG_PINS 순서)

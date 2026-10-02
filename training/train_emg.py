@@ -114,6 +114,8 @@ CFG = {
     "vote_n": 3,                # 최근 vote_n번 판단 중
     "vote_k": 2,                # vote_k번 이상 같은 손가락이면 켬 (vote_n = vote_k 이면 "연속 k번")
     "vote_switch_k": None,      # 켜진 손가락에서 다른 손가락으로 바꿀 때 필요한 연속 횟수 (None이면 vote_k와 같음)
+    "vote_release_n": 1,        # 휴식 판단이 이만큼 연속으로 나와야 끔
+    "vote_hold_s": 0.0,         # 출력이 바뀐 뒤 최소 이 시간 동안은 다시 안 바꿈 (깜빡임 방지)
     "rest_gate": 0.0,           # 모든 채널 신호가 휴식 기준의 이 배수보다 작으면 무조건 휴식 (0이면 끔)
 
     # ---- ESP32 테스트 데이터 ----
@@ -449,7 +451,7 @@ def confusion(y, p, n):
     return cm
 
 
-def vote_sequence(preds, vote_n, rest_idx, vote_k=None, switch_k=None):
+def vote_sequence(preds, vote_n, rest_idx, vote_k=None, switch_k=None, release_n=1, hold_n=0):
     """켜기는 신중하게, 끄기는 빠르게 (ESP32의 emg_vote_update와 같은 규칙)
     - 이번 판단이 Rest면 바로 Rest
     - 휴식 상태에서: 최근 vote_n번 중 vote_k번 이상 같은 손가락이면 켬
@@ -461,10 +463,17 @@ def vote_sequence(preds, vote_n, rest_idx, vote_k=None, switch_k=None):
         switch_k = vote_k
     out = []
     prev = rest_idx
+    since = 1 << 30          # 마지막으로 출력이 바뀐 뒤 지난 판단 수
+    rest_run = 0             # 연속된 휴식 판단 수
     for i in range(len(preds)):
+        since += 1
+        cand = prev
         if preds[i] == rest_idx:
-            prev = rest_idx
+            rest_run += 1
+            if rest_run >= release_n:          # 휴식이 release_n번 연속이면 끔
+                cand = rest_idx
         else:
+            rest_run = 0
             if prev == rest_idx:
                 hist, need = preds[max(0, i - vote_n + 1):i + 1], vote_k
             else:
@@ -472,9 +481,17 @@ def vote_sequence(preds, vote_n, rest_idx, vote_k=None, switch_k=None):
             vals, cnt = np.unique(hist, return_counts=True)
             best = int(vals[np.argmax(cnt)])
             if cnt.max() >= need and best != rest_idx and best != prev:
-                prev = best
+                cand = best
+        if cand != prev and since >= hold_n:   # 바뀐 지 얼마 안 됐으면 유지
+            prev = cand
+            since = 0
         out.append(prev)
     return np.array(out)
+
+
+def hold_decisions(cfg):
+    """최소 유지 시간을 판단 횟수로 바꿈"""
+    return int(round(cfg["vote_hold_s"] / cfg["step_eval_s"]))
 
 
 def rest_gate_mask(windows_rms, rest_rms, gate):
@@ -512,7 +529,8 @@ def realtime_simulation(model, sessions, cfg, norm, rest_rms=None):
         if cfg["rest_gate"] and rest_rms is not None:
             rms = np.stack([np.sqrt((sess["filt"][t - L:t] ** 2).mean(axis=0)) for t in ends])
             raw_pred = np.where(rest_gate_mask(rms, rest_rms, cfg["rest_gate"]), rest, raw_pred)
-        voted = vote_sequence(raw_pred, cfg["vote_n"], rest, cfg["vote_k"], cfg["vote_switch_k"])
+        voted = vote_sequence(raw_pred, cfg["vote_n"], rest, cfg["vote_k"], cfg["vote_switch_k"],
+                              cfg["vote_release_n"], hold_decisions(cfg))
         results.append({"sess": sess, "ends": ends, "raw": raw_pred, "voted": voted})
     return results
 
@@ -733,6 +751,8 @@ def export_model_header(model, cfg, sos, norm, path, rest_rms=None):
     h.append(f"#define EMG_VOTE_K        {cfg['vote_k']}\n")
     h.append(f"#define EMG_VOTE_SWITCH_K {cfg['vote_switch_k'] or cfg['vote_k']}\n")
     h.append(f"#define EMG_REST_GATE     {float(cfg['rest_gate'] or 0.0):.3f}f\n")
+    h.append(f"#define EMG_VOTE_RELEASE_N {cfg['vote_release_n']}\n")
+    h.append(f"#define EMG_VOTE_HOLD_N   {hold_decisions(cfg)}\n")
     h.append(f"#define EMG_REST_CLASS    {cfg['class_names'].index('Rest')}\n\n")
     h.append("// 모델이 쓰는 채널 (CSV의 Ch 번호 = 보드의 EMG_PINS 순서)\n")
     h.append("static const int EMG_CHANNEL_IDX[EMG_NUM_CH] = { "
@@ -939,7 +959,8 @@ def run(cfg, verbose=True, export=True):
         "클래스별 1초 단위 정답률: " + ", ".join(f"{n} {r * 100:.0f}%" for n, r in zip(names, recall)),
         "",
         f"=== 실시간 흉내 ({cfg['step_eval_s'] * 1000:.0f}ms마다 판단 / 켜기: 최근 {cfg['vote_n']}번 중 {cfg['vote_k']}번, "
-        f"바꾸기: 연속 {cfg['vote_switch_k'] or cfg['vote_k']}번, 끄기: Rest 1번, 휴식 게이트 {cfg['rest_gate'] or '끔'}) ===",
+        f"바꾸기: 연속 {cfg['vote_switch_k'] or cfg['vote_k']}번, 끄기: Rest {cfg['vote_release_n']}번 연속, "
+        f"최소 유지 {cfg['vote_hold_s']}초, 휴식 게이트 {cfg['rest_gate'] or '끔'}) ===",
         f"안정 구간 정확도: {rtm['acc'] * 100:.1f}%",
         f"휴식 중 잘못 움직임 판단 비율: {rtm['false_move_rate'] * 100:.1f}%",
         f"힘주기 시작 -> 올바른 판단까지 걸린 시간(중앙값): {rtm['latency_median']:.2f}초",
@@ -991,7 +1012,8 @@ FAST_PRESET = {
     "win": 64, "hop": 32, "nfft": 64, "band_start_bin": 2, "band_width": 2, "num_bands": 13,
     "label_delay_s": 0.05, "label_margin_s": 0.15, "contract_trim_start_s": 0.15,
     "relax_trim_start_s": 0.5, "relax_trim_end_s": 0.15,
-    "vote_n": 3, "vote_k": 3, "vote_switch_k": 5, "rest_gate": 2.0,
+    "vote_n": 3, "vote_k": 3, "vote_switch_k": 8, "rest_gate": 2.0,
+    "vote_release_n": 3, "vote_hold_s": 0.5,
     "out_dir": os.path.join(BASE_DIR, "output_fast"),
 }
 
