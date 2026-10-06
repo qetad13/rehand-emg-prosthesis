@@ -8,6 +8,10 @@
 //   MODE_CHECK  : 센서 상태 확인 (채널별 평균/흔들림/클리핑)
 //   MODE_RUN    : 0.5초마다 판단 (새 데이터로 학습한 모델이 들어간 뒤에 사용)
 //   MODE_REPLAY : 센서 없이 저장된 데이터로 판단 흐름 확인
+//
+// MODE_RUN 안에서는 스위치로 두 가지 동작 모드를 오갑니다. (아래 "모드 전환" 참고)
+//   근전도 모드 : 근전도 판단 결과를 의수로 보냄 (기본)
+//   매크로 모드 : 근전도를 쓰지 않고, 스위치로 고른 동작(명령 11~19)을 의수로 보냄
 // =====================================================================
 #include "emg_infer.h"
 #include "emg_test_vectors.h"
@@ -107,6 +111,150 @@ static uint8_t HAND_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 }
 
 // ---------------------------------------------------------------------
+// 모드 전환 (MODE_RUN에서만 동작)
+//   SW1 : 근전도 모드 <-> 매크로 모드
+//   SW2 : 매크로 모드에서 다음 동작으로 넘김
+//         (근전도 모드에서는 나중에 '사용자 보정'을 시작할 자리, 지금은 안내만 출력)
+//
+// 스위치가 없어도 아래 두 가지로 대신 누를 수 있습니다.
+//   - 시리얼 모니터에서 1 전송 = SW1, 2 전송 = SW2
+//   - 보드의 BOOT 버튼: 짧게 = SW2, 길게(0.8초) = SW1
+// 스위치 핀: SW1 = D7(8번 패드), SW2 = D8(9번 패드). 서로 반대로 달렸으면 두 번호만 바꾸면 됩니다.
+// (D7은 UART 수신 핀이기도 해서, Arduino IDE의 USB CDC On Boot가 Enabled여야 합니다)
+// ---------------------------------------------------------------------
+#define SW1_PIN         D7    // PCB 8번 패드. 스위치가 없는 보드면 -1
+#define SW2_PIN         D8    // PCB 9번 패드. 스위치가 없는 보드면 -1
+#define SW_PRESSED      LOW   // 누르면 GND에 연결되는 회로 기준 (내부 풀업 사용).
+                              // 누르면 3.3V에 연결되는 회로면 HIGH로 변경
+#define USE_SERIAL_KEYS 1     // 시리얼 1, 2 키로 스위치 흉내
+#define USE_BOOT_BTN    1     // BOOT 버튼으로 스위치 흉내 (PCB가 오면 0으로 꺼도 됨)
+#define BOOT_BTN_PIN    0     // XIAO ESP32-S3의 BOOT 버튼 (누르면 LOW)
+#define LONG_PRESS_MS   800   // BOOT 버튼을 이 시간 이상 누르면 SW1로 처리
+
+// 매크로 모드에서 SW2를 누를 때마다 이 순서로 넘어갑니다. {이름, 의수 명령 번호}
+//   근전도 모드가 보내는 번호: 1~8   (엄지, 검지, 중지, 약지, 소지, 휴식, 주먹, 집게)
+//   매크로 모드가 보내는 번호: 11~19 (의수 보드에서 번호별 동작을 정함)
+// 매크로 모드에 들어가면 바로 첫 줄(11)을 보내고, 마지막(19) 다음은 다시 11입니다.
+// 이름은 시리얼 출력용이라 동작이 정해지면 자유롭게 바꿔도 됩니다.
+struct MacroItem { const char *name; uint8_t cmd; };
+static const MacroItem MACROS[] = {
+  {"매크로 1", 11},
+  {"매크로 2", 12},
+  {"매크로 3", 13},
+  {"매크로 4", 14},
+  {"매크로 5", 15},
+  {"매크로 6", 16},
+  {"매크로 7", 17},
+  {"매크로 8", 18},
+  {"매크로 9", 19},
+};
+#define MACRO_COUNT ((int)(sizeof(MACROS) / sizeof(MACROS[0])))
+
+#define CTRL_EMG   0   // 근전도 모드
+#define CTRL_MACRO 1   // 매크로 모드
+
+#if RUN_MODE == MODE_RUN
+static volatile uint8_t s_ctrlMode = CTRL_EMG;
+static volatile uint8_t s_macroIdx = 0;
+
+// SW1이 눌렸을 때: 모드 전환. LED가 켜져 있으면 매크로 모드
+static void onSw1Pressed() {
+  if (s_ctrlMode == CTRL_EMG) {
+    s_macroIdx = 0;
+    s_ctrlMode = CTRL_MACRO;
+    Serial.printf("=== 매크로 모드 === 동작 1/%d: %s (의수 명령 %d)\n", MACRO_COUNT,
+                  MACROS[0].name, MACROS[0].cmd);
+  } else {
+    s_ctrlMode = CTRL_EMG;
+    Serial.println("=== 근전도 모드 === (휴식에서 다시 시작)");
+  }
+  digitalWrite(LED_BUILTIN, s_ctrlMode == CTRL_MACRO ? LOW : HIGH);
+}
+
+// SW2가 눌렸을 때
+static void onSw2Pressed() {
+  if (s_ctrlMode == CTRL_MACRO) {
+    const uint8_t i = (uint8_t)((s_macroIdx + 1) % MACRO_COUNT);
+    s_macroIdx = i;
+    Serial.printf(">>> 매크로 동작 %d/%d: %s (의수 명령 %d)\n", i + 1, MACRO_COUNT,
+                  MACROS[i].name, MACROS[i].cmd);
+  } else {
+    // TODO: 사용자 보정(마지막 층 다시 학습) 시작. 아직 구현 전
+    Serial.println("[SW2] 근전도 모드: 사용자 보정은 아직 구현 전입니다");
+  }
+}
+
+// 버튼 하나의 상태 (10ms마다 확인, 3번 연속 같은 값이어야 인정 = 떨림 제거)
+#define BTN_NONE  0
+#define BTN_SHORT 1
+#define BTN_LONG  2
+struct Button {
+  int      pin;            // -1이면 없는 버튼
+  int      pressedLevel;   // 눌렸을 때 핀 값 (LOW 또는 HIGH)
+  bool     down;
+  uint8_t  same;
+  uint32_t downMs;
+  bool     longDone;
+
+  void begin(int p, int level) {
+    pin = p; pressedLevel = level;
+    down = false; same = 0; downMs = 0; longDone = false;
+    if (pin >= 0) pinMode(pin, level == LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
+  }
+
+  // useLong = false : 누르는 순간 BTN_SHORT
+  // useLong = true  : 짧게 눌렀다 떼면 BTN_SHORT, LONG_PRESS_MS 이상 누르고 있으면 BTN_LONG
+  int poll(bool useLong) {
+    if (pin < 0) return BTN_NONE;
+    const bool raw = (digitalRead(pin) == pressedLevel);
+    if (raw == down) {
+      same = 0;
+    } else if (++same >= 3) {
+      same = 0;
+      down = raw;
+      if (raw) {                                 // 눌림
+        downMs = millis();
+        longDone = false;
+        if (!useLong) return BTN_SHORT;
+      } else if (useLong && !longDone) {         // 짧게 눌렀다 뗌
+        return BTN_SHORT;
+      }
+    }
+    if (useLong && down && !longDone && millis() - downMs >= LONG_PRESS_MS) {
+      longDone = true;
+      return BTN_LONG;
+    }
+    return BTN_NONE;
+  }
+};
+
+// 스위치 확인 전용 태스크 (코어 0). 1kHz 측정 루프(코어 1)는 건드리지 않음
+static void ctrlTaskFn(void *arg) {
+  (void)arg;
+  Button sw1, sw2, boot;
+  sw1.begin(SW1_PIN, SW_PRESSED);
+  sw2.begin(SW2_PIN, SW_PRESSED);
+  boot.begin(USE_BOOT_BTN ? BOOT_BTN_PIN : -1, LOW);
+
+  for (;;) {
+#if USE_SERIAL_KEYS
+    while (Serial.available() > 0) {
+      const int ch = Serial.read();
+      if (ch == '1') onSw1Pressed();
+      else if (ch == '2') onSw2Pressed();   // 줄바꿈 등 다른 글자는 무시
+    }
+#endif
+    if (sw1.poll(false) == BTN_SHORT) onSw1Pressed();
+    if (sw2.poll(false) == BTN_SHORT) onSw2Pressed();
+    const int ev = boot.poll(true);
+    if (ev == BTN_LONG) onSw1Pressed();
+    else if (ev == BTN_SHORT) onSw2Pressed();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+#endif  // RUN_MODE == MODE_RUN
+
+// ---------------------------------------------------------------------
 // 내부 동작 (보통 수정할 필요 없음)
 // ---------------------------------------------------------------------
 static const uint32_t SAMPLE_US = 1000000UL / EMG_FS;
@@ -186,8 +334,32 @@ static void inferTaskFn(void *arg) {
   int lastOutput = EMG_REST_CLASS;
   float probs[EMG_NUM_CLASSES];
 
+#if RUN_MODE == MODE_RUN
+  uint8_t prevMode = CTRL_EMG;
+#endif
+
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+#if RUN_MODE == MODE_RUN
+    const uint8_t mode = s_ctrlMode;
+    if (mode == CTRL_MACRO) {
+      // 매크로 모드: 근전도 판단은 하지 않고, 고른 동작을 판단 주기마다 계속 보냄
+      // (한 번 못 받아도 다음 전송에서 복구됨. 의수 보드는 같은 명령이 반복되면 무시)
+      prevMode = mode;
+#if USE_ESPNOW
+      sendHandCommand(MACROS[s_macroIdx].cmd);
+#endif
+      s_busy = false;
+      continue;
+    }
+    if (prevMode != mode) {
+      // 매크로 -> 근전도로 돌아온 직후: 예전 판단 기록을 지우고 휴식에서 다시 시작
+      emg_vote_reset(&vote);
+      lastOutput = EMG_REST_CLASS;
+      prevMode = mode;
+    }
+#endif
 
     uint32_t t0 = micros();
     int pred = emg_classify(s_epoch, probs);
@@ -330,7 +502,9 @@ void setup() {
   Serial.println("- EMGFilters를 거친 값이라 평균은 0 근처입니다");
   Serial.println("- 원본평균이 4095나 0에 가깝거나 클리핑 숫자가 0보다 크면 센서 연결/전압 확인");
 #else
-  Serial.println("===== MODE_RUN: 0.5초마다 판단합니다 =====");
+  Serial.println("===== MODE_RUN: 근전도 모드로 시작합니다 =====");
+  Serial.println("- 모드 전환(SW1): 시리얼에서 1 전송, 또는 BOOT 버튼 길게");
+  Serial.println("- 다음 동작(SW2): 시리얼에서 2 전송, 또는 BOOT 버튼 짧게 (매크로 모드에서)");
 #endif
 #endif
 
@@ -346,6 +520,11 @@ void setup() {
 #endif
   emg_init();   // 첫 판단이 늦어서 건너뛰지 않도록 계산용 표를 미리 준비
   xTaskCreatePinnedToCore(inferTaskFn, "emg_infer", 8192, NULL, 1, &s_inferTask, 0);
+#endif
+#if RUN_MODE == MODE_RUN
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);            // 꺼짐 = 근전도 모드, 켜짐 = 매크로 모드
+  xTaskCreatePinnedToCore(ctrlTaskFn, "emg_ctrl", 4096, NULL, 2, NULL, 0);
 #endif
 
   s_nextUs = micros();
