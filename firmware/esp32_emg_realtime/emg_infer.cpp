@@ -249,6 +249,23 @@ int emg_rest_gate(const float *epoch, int pred) {
 }
 
 // ---------------------------------------------------------------
+// 힘 세기 (휴식 게이트와 같은 계산, 다만 최근 n_last개 샘플만 사용)
+// ---------------------------------------------------------------
+float emg_strength(const float *epoch, int n_last) {
+  if (n_last <= 0 || n_last > EMG_EPOCH_LEN) n_last = EMG_EPOCH_LEN;
+  float best = 0.0f;
+  for (int c = 0; c < EMG_NUM_CH; ++c) {
+    if (EMG_REST_RMS[c] <= 0.0f) continue;
+    const float *x = epoch + c * EMG_EPOCH_LEN + (EMG_EPOCH_LEN - n_last);
+    float acc = 0.0f;
+    for (int n = 0; n < n_last; ++n) acc += x[n] * x[n];
+    const float ratio = sqrtf(acc / (float)n_last) / EMG_REST_RMS[c];
+    if (ratio > best) best = ratio;
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------
 // 최종 출력 규칙 (train_emg.py의 vote_sequence와 같음)
 // ---------------------------------------------------------------
 void emg_vote_reset(EmgVote *v) {

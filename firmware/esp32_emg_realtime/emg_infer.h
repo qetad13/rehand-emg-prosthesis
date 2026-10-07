@@ -62,6 +62,14 @@ typedef struct {
 void emg_vote_reset(EmgVote *v);
 int  emg_vote_update(EmgVote *v, int pred);
 
+// ---------------------------------------------------------------
+// 5) 힘 세기: 최근 n_last개 샘플에서 채널별 (신호 크기 / 휴식 때 크기)를 구해 가장 큰 값을 돌려줌
+//    1.0 근처 = 휴식 수준, EMG_REST_GATE 미만 = 휴식 게이트에 걸리는 크기
+//    어떤 손가락인지는 emg_classify가, 얼마나 세게 주는지는 이 값이 알려줌
+//    (emg_classify는 창마다 크기를 정규화해서 보기 때문에 세기 정보를 쓰지 않음)
+// ---------------------------------------------------------------
+float emg_strength(const float *epoch, int n_last);
+
 #ifdef __cplusplus
 }
 #endif

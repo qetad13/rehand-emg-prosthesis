@@ -9,6 +9,9 @@
 //   MODE_RUN    : 0.5초마다 판단 (새 데이터로 학습한 모델이 들어간 뒤에 사용)
 //   MODE_REPLAY : 센서 없이 저장된 데이터로 판단 흐름 확인
 //
+// MODE_RUN에서는 판단 결과(어떤 손가락)와 함께 힘 세기(1~100)도 의수로 보냅니다.
+// (아래 "힘 세기" 참고. 세게 주면 큰 값 -> 의수 보드가 모터 속도로 사용)
+//
 // MODE_RUN 안에서는 스위치로 두 가지 동작 모드를 오갑니다. (아래 "모드 전환" 참고)
 //   근전도 모드 : 근전도 판단 결과를 의수로 보냄 (기본)
 //   매크로 모드 : 근전도를 쓰지 않고, 스위치로 고른 동작(명령 11~19)을 의수로 보냄
@@ -58,6 +61,12 @@ static int s_lastRaw[REC_CH];   // 필터 전 원본 값 (상태 확인용)
 // ---------------------------------------------------------------------
 #define USE_ESPNOW 1
 
+// 보내는 내용: 2바이트 {명령 번호, 힘 세기}
+//   힘 세기 1~100 : 근전도 모드에서 손가락 동작 중일 때 (클수록 세게 -> 의수는 빠르게)
+//   힘 세기 0     : 세기 정보 없음 (휴식, 매크로 모드) -> 의수는 기본 속도로
+// 의수 보드가 아직 1바이트만 받는 코드라면 0으로 바꾸면 예전처럼 명령 번호만 보냅니다.
+#define SEND_STRENGTH 1
+
 // 판단 결과 -> 의수 보드 명령 번호 (팀에서 정한 번호, 이름으로 연결해서 동작 순서가 바뀌어도 안전)
 //   1 엄지, 2 검지, 3 중지, 4 약지, 5 소지, 6 휴식, 7 주먹, 8 집게
 static uint8_t handCmdFor(int gesture) {
@@ -98,9 +107,10 @@ static uint8_t HAND_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
   Serial.println(WiFi.macAddress());
 }
 
-[[maybe_unused]] static void sendHandCommand(uint8_t cmd) {
+[[maybe_unused]] static void sendHandCommand(uint8_t cmd, uint8_t strength) {
   if (!s_espnowReady) return;
-  esp_err_t r = esp_now_send(HAND_MAC, &cmd, 1);
+  const uint8_t pkt[2] = {cmd, strength};
+  esp_err_t r = esp_now_send(HAND_MAC, pkt, SEND_STRENGTH ? 2 : 1);
   if (r != ESP_OK) Serial.printf("[ESP-NOW] 전송 실패 (%d)\n", (int)r);
 }
 
@@ -108,6 +118,69 @@ static uint8_t HAND_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 [[maybe_unused]] static void onOutputChanged(int gesture) {
   Serial.printf(">>> 출력 변경: %s (의수 명령 %d)\n", EMG_CLASS_NAMES[gesture],
                 handCmdFor(gesture));
+}
+
+// ---------------------------------------------------------------------
+// 힘 세기 (세게 주면 빠르게, 약하게 주면 천천히)
+//
+// "어떤 손가락인지"는 AI가 판단하고, "얼마나 세게 주는지"는 신호 크기로 따로 잽니다.
+// (AI는 창마다 신호 크기를 똑같이 맞춘 뒤에 모양만 보기 때문에 세기를 알 수 없음)
+//
+//   세기(배) = 최근 0.2초 신호 크기가 쉴 때의 몇 배인지 (4채널 중 가장 큰 값)
+//   세기(%)  = 휴식 게이트 크기를 0%, 아래 동작별 기준을 100%로 놓고 바꾼 값
+//
+// 같은 힘이라도 동작마다 신호 크기가 많이 달라서(약지 약 40배, 엄지 약 6배) 기준을 동작별로 둡니다.
+// ---------------------------------------------------------------------
+#define STRENGTH_WIN_MS  200    // 세기를 재는 구간 (최근 몇 ms)
+#define STRENGTH_SMOOTH  0.5f   // 0~1. 작을수록 값이 부드럽지만 반응이 느림 (1이면 그대로)
+#define STRENGTH_LEVELS  0      // 0 = 1~100 연속값 / 2 = 약,강 (50,100) / 3 = 약,중,강 (33,66,100)
+#define STRENGTH_HYST    8.0f   // 단계로 나눌 때, 경계를 이만큼(%) 더 넘어야 단계가 바뀜 (깜빡임 방지)
+#define STRENGTH_REPORT  1      // 동작이 끝날 때마다 세기 요약을 출력 (아래 기준 값을 맞출 때 사용)
+
+// 동작별 100% 기준 = 평소 녹화하던 힘으로 줬을 때, 인식 직후 0.5초 동안의 평균 세기(배)
+// (지금 data 폴더의 녹화 20개에서 구한 중앙값)
+// - 센서를 다시 붙였거나 새로 녹화했으면: 평소 힘으로 몇 번 해보고 시리얼의
+//   ">>> 세기 요약 ... 처음 0.5초 평균" 값으로 바꾸세요.
+// - 평소 힘이 100%가 아니라 중간쯤이 되게 하려면 숫자를 키우면 됩니다 (예: 1.5배).
+[[maybe_unused]] static float strengthFullFor(int gesture) {
+  const char *n = EMG_CLASS_NAMES[gesture];
+  if (!strcmp(n, "Thumb"))  return 6.4f;
+  if (!strcmp(n, "Index"))  return 9.2f;
+  if (!strcmp(n, "Middle")) return 23.0f;
+  if (!strcmp(n, "Ring"))   return 40.0f;
+  if (!strcmp(n, "Little")) return 7.8f;
+  if (!strcmp(n, "Fist"))   return 21.0f;
+  if (!strcmp(n, "Pinch"))  return 5.7f;
+  return 10.0f;
+}
+
+// 세기(배) -> 0~100%
+[[maybe_unused]] static float strengthPercent(int gesture, float ratio) {
+  const float lo = (EMG_REST_GATE > 1.0f) ? EMG_REST_GATE : 1.5f;   // 이 크기 아래는 어차피 휴식
+  float hi = strengthFullFor(gesture);
+  if (hi < lo + 0.5f) hi = lo + 0.5f;
+  const float p = (ratio - lo) / (hi - lo) * 100.0f;
+  return p < 0.0f ? 0.0f : (p > 100.0f ? 100.0f : p);
+}
+
+// 세기(%) -> 의수로 보낼 값 (1~100). level에는 현재 단계를 기억해 둠 (0 = 아직 없음)
+[[maybe_unused]] static uint8_t strengthToByte(float pct, uint8_t *level) {
+#if STRENGTH_LEVELS >= 2
+  const float w = 100.0f / STRENGTH_LEVELS;          // 한 단계의 폭 (%)
+  int lv = (int)(pct / w) + 1;
+  if (lv > STRENGTH_LEVELS) lv = STRENGTH_LEVELS;
+  const int prev = *level;
+  if (prev >= 1) {
+    if (lv > prev && pct < prev * w + STRENGTH_HYST) lv = prev;          // 살짝 넘은 정도면 유지
+    if (lv < prev && pct > (prev - 1) * w - STRENGTH_HYST) lv = prev;
+  }
+  *level = (uint8_t)lv;
+  return (uint8_t)(lv * 100 / STRENGTH_LEVELS);
+#else
+  (void)level;
+  const int v = (int)(pct + 0.5f);
+  return (uint8_t)(v < 1 ? 1 : (v > 100 ? 100 : v));
+#endif
 }
 
 // ---------------------------------------------------------------------
@@ -334,6 +407,13 @@ static void inferTaskFn(void *arg) {
   int lastOutput = EMG_REST_CLASS;
   float probs[EMG_NUM_CLASSES];
 
+  // 힘 세기
+  float   strengthPct = 0.0f;     // 부드럽게 만든 세기 (%)
+  uint8_t strengthLevel = 0;      // 단계로 나눌 때의 현재 단계
+  const int earlyN = (500 / EMG_STEP_LEN) > 0 ? (500 / EMG_STEP_LEN) : 1;   // 처음 0.5초 = 판단 몇 번
+  float sumEarly = 0.0f, sumLate = 0.0f;   // 세기 요약용
+  int   nEarly = 0, nLate = 0;
+
 #if RUN_MODE == MODE_RUN
   uint8_t prevMode = CTRL_EMG;
 #endif
@@ -348,7 +428,7 @@ static void inferTaskFn(void *arg) {
       // (한 번 못 받아도 다음 전송에서 복구됨. 의수 보드는 같은 명령이 반복되면 무시)
       prevMode = mode;
 #if USE_ESPNOW
-      sendHandCommand(MACROS[s_macroIdx].cmd);
+      sendHandCommand(MACROS[s_macroIdx].cmd, 0);
 #endif
       s_busy = false;
       continue;
@@ -357,6 +437,8 @@ static void inferTaskFn(void *arg) {
       // 매크로 -> 근전도로 돌아온 직후: 예전 판단 기록을 지우고 휴식에서 다시 시작
       emg_vote_reset(&vote);
       lastOutput = EMG_REST_CLASS;
+      strengthPct = 0.0f;
+      strengthLevel = 0;
       prevMode = mode;
     }
 #endif
@@ -366,6 +448,19 @@ static void inferTaskFn(void *arg) {
     pred = emg_rest_gate(s_epoch, pred);        // 신호가 휴식 수준이면 무조건 휴식
     int output = emg_vote_update(&vote, pred);
     uint32_t dtMs = (micros() - t0) / 1000UL;
+
+    // ---- 힘 세기 ----
+    const float ratio = emg_strength(s_epoch, STRENGTH_WIN_MS * EMG_FS / 1000);   // 쉴 때의 몇 배
+    uint8_t strengthOut = 0;                       // 의수로 보낼 값 (0 = 세기 정보 없음)
+    if (output != lastOutput) strengthLevel = 0;
+    if (output == EMG_REST_CLASS) {
+      strengthPct = 0.0f;
+    } else {
+      const float p = strengthPercent(output, ratio);
+      if (output != lastOutput) strengthPct = p;                    // 동작이 시작된 순간에는 바로 반영
+      else strengthPct += STRENGTH_SMOOTH * (p - strengthPct);      // 그 뒤로는 부드럽게 따라감
+      strengthOut = strengthToByte(strengthPct, &strengthLevel);
+    }
 
     static uint32_t s_decisions = 0;
     s_decisions++;
@@ -382,6 +477,7 @@ static void inferTaskFn(void *arg) {
       for (int n = 0; n < EMG_EPOCH_LEN; ++n) acc += (double)x[n] * x[n];
       Serial.printf(" %4.0f", sqrt(acc / EMG_EPOCH_LEN));
     }
+    Serial.printf(" | 세기 %4.1f배 %3d%%", ratio, (int)strengthOut);
     Serial.printf(" | %lu ms", (unsigned long)dtMs);
 #if RUN_MODE == MODE_REPLAY
     Serial.printf(" | 재생 중: %s", EMG_CLASS_NAMES[EMG_TEST_LABEL[s_replayVec]]);
@@ -393,11 +489,25 @@ static void inferTaskFn(void *arg) {
 
     if (output != lastOutput) {
       onOutputChanged(output);
+#if STRENGTH_REPORT
+      if (lastOutput != EMG_REST_CLASS && nEarly > 0) {   // 방금 끝난 동작의 세기 요약
+        Serial.printf(">>> 세기 요약 %s: 처음 0.5초 평균 %.1f배 (100%% 기준 %.1f배)",
+                      EMG_CLASS_NAMES[lastOutput], sumEarly / nEarly, strengthFullFor(lastOutput));
+        if (nLate > 0) Serial.printf(", 그 뒤 평균 %.1f배", sumLate / nLate);
+        Serial.println();
+      }
+#endif
+      sumEarly = sumLate = 0.0f;
+      nEarly = nLate = 0;
       lastOutput = output;
     }
+    if (output != EMG_REST_CLASS) {                // 세기 요약용 누적
+      if (nEarly < earlyN) { sumEarly += ratio; nEarly++; }
+      else                 { sumLate += ratio;  nLate++; }
+    }
 #if RUN_MODE == MODE_RUN && USE_ESPNOW
-    // 0.5초마다 현재 명령을 보냄 (바뀌면 바로 반영되고, 한 번 못 받아도 다음에 복구됨)
-    sendHandCommand(handCmdFor(output));
+    // 판단할 때마다 현재 명령과 힘 세기를 보냄 (바뀌면 바로 반영되고, 한 번 못 받아도 다음에 복구됨)
+    sendHandCommand(handCmdFor(output), strengthOut);
 #endif
     s_busy = false;
   }
