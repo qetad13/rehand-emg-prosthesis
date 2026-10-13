@@ -30,6 +30,7 @@
 #define MODE_RUN    2
 #define MODE_RECORD 3
 #define RUN_MODE    MODE_RUN
+// 정확 모드 / 빠른 모드는 여기가 아니라 emg_mode.h 탭의 EMG_FAST_MODE (0 / 1)로 고릅니다
 
 // 녹화는 항상 4채널 (CSV의 Ch 00, Ch 01, Ch 02, Ch 03 순서)
 // 판단에는 그중 모델이 쓰는 채널(emg_model.h의 EMG_CHANNEL_IDX)만 사용
@@ -185,12 +186,13 @@ static uint8_t HAND_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // ---------------------------------------------------------------------
 // 모드 전환 (MODE_RUN에서만 동작)
-//   SW1 : 근전도 모드 <-> 매크로 모드
+//   SW1 짧게 : 근전도 모드 <-> 매크로 모드 (손을 뗄 때 바뀜)
+//   SW1 3초  : 의수 호밍 (LED가 빠르게 3번 깜빡이면 전송된 것, 모드는 그대로)
 //   SW2 : 매크로 모드에서 다음 동작으로 넘김
 //         (근전도 모드에서는 나중에 '사용자 보정'을 시작할 자리, 지금은 안내만 출력)
 //
 // 스위치가 없어도 아래 두 가지로 대신 누를 수 있습니다.
-//   - 시리얼 모니터에서 1 전송 = SW1, 2 전송 = SW2
+//   - 시리얼 모니터에서 1 전송 = SW1, 2 전송 = SW2, h 전송 = 호밍
 //   - 보드의 BOOT 버튼: 짧게 = SW2, 길게(0.8초) = SW1
 // 스위치 핀: SW1 = D7(8번 패드), SW2 = D8(9번 패드). 서로 반대로 달렸으면 두 번호만 바꾸면 됩니다.
 // (D7은 UART 수신 핀이기도 해서, Arduino IDE의 USB CDC On Boot가 Enabled여야 합니다)
@@ -203,6 +205,9 @@ static uint8_t HAND_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 #define USE_BOOT_BTN    1     // BOOT 버튼으로 스위치 흉내 (PCB가 오면 0으로 꺼도 됨)
 #define BOOT_BTN_PIN    0     // XIAO ESP32-S3의 BOOT 버튼 (누르면 LOW)
 #define LONG_PRESS_MS   800   // BOOT 버튼을 이 시간 이상 누르면 SW1로 처리
+#define HOMING_PRESS_MS 3000  // SW1을 이 시간 이상 누르고 있으면 의수 호밍
+#define HAND_CMD_HOMING 20    // 의수 보드로 보내는 호밍 명령 번호
+#define HOMING_SEND_N   3     // 무선은 가끔 빠지므로 여러 번 보냄 (의수 쪽에서 1번만 실행)
 
 // 매크로 모드에서 SW2를 누를 때마다 이 순서로 넘어갑니다. {이름, 의수 명령 번호}
 //   근전도 모드가 보내는 번호: 1~8   (엄지, 검지, 중지, 약지, 소지, 휴식, 주먹, 집게)
@@ -257,6 +262,20 @@ static void onSw2Pressed() {
   }
 }
 
+// SW1을 3초 누르고 있을 때: 의수에 호밍 명령 전송
+static void onHomingRequested() {
+  Serial.println("=== 의수 호밍 요청 전송 ===");
+  for (int i = 0; i < HOMING_SEND_N; ++i) {
+    sendHandCommand(HAND_CMD_HOMING, 0);
+    vTaskDelay(pdMS_TO_TICKS(30));
+  }
+  // 손 뗄 시점을 알 수 있게 LED 빠르게 3번 깜빡인 뒤 원래 상태(모드 표시)로
+  for (int i = 0; i < 3; ++i) {
+    digitalWrite(LED_BUILTIN, LOW);  vTaskDelay(pdMS_TO_TICKS(100));
+    digitalWrite(LED_BUILTIN, HIGH); vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  digitalWrite(LED_BUILTIN, s_ctrlMode == CTRL_MACRO ? LOW : HIGH);
+}
 // 버튼 하나의 상태 (10ms마다 확인, 3번 연속 같은 값이어야 인정 = 떨림 제거)
 #define BTN_NONE  0
 #define BTN_SHORT 1
@@ -275,9 +294,10 @@ struct Button {
     if (pin >= 0) pinMode(pin, level == LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
   }
 
-  // useLong = false : 누르는 순간 BTN_SHORT
-  // useLong = true  : 짧게 눌렀다 떼면 BTN_SHORT, LONG_PRESS_MS 이상 누르고 있으면 BTN_LONG
-  int poll(bool useLong) {
+  // longMs = 0 : 누르는 순간 BTN_SHORT
+  // longMs > 0 : 짧게 눌렀다 떼면 BTN_SHORT, longMs 이상 누르고 있으면 BTN_LONG (뗄 때는 아무것도 안 함)
+  int poll(uint32_t longMs) {
+    const bool useLong = (longMs > 0);
     if (pin < 0) return BTN_NONE;
     const bool raw = (digitalRead(pin) == pressedLevel);
     if (raw == down) {
@@ -293,7 +313,7 @@ struct Button {
         return BTN_SHORT;
       }
     }
-    if (useLong && down && !longDone && millis() - downMs >= LONG_PRESS_MS) {
+    if (useLong && down && !longDone && millis() - downMs >= longMs) {
       longDone = true;
       return BTN_LONG;
     }
@@ -314,12 +334,15 @@ static void ctrlTaskFn(void *arg) {
     while (Serial.available() > 0) {
       const int ch = Serial.read();
       if (ch == '1') onSw1Pressed();
-      else if (ch == '2') onSw2Pressed();   // 줄바꿈 등 다른 글자는 무시
+      else if (ch == '2') onSw2Pressed();
+      else if (ch == 'h' || ch == 'H') onHomingRequested();   // 줄바꿈 등 다른 글자는 무시
     }
 #endif
-    if (sw1.poll(false) == BTN_SHORT) onSw1Pressed();
-    if (sw2.poll(false) == BTN_SHORT) onSw2Pressed();
-    const int ev = boot.poll(true);
+    const int e1 = sw1.poll(HOMING_PRESS_MS);
+    if (e1 == BTN_LONG) onHomingRequested();
+    else if (e1 == BTN_SHORT) onSw1Pressed();
+    if (sw2.poll(0) == BTN_SHORT) onSw2Pressed();
+    const int ev = boot.poll(LONG_PRESS_MS);
     if (ev == BTN_LONG) onSw1Pressed();
     else if (ev == BTN_SHORT) onSw2Pressed();
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -604,6 +627,7 @@ void setup() {
 #else
   delay(2000);
   Serial.println();
+  Serial.printf("모델: %s  (바꾸려면 emg_mode.h 탭)\n", EMG_MODE_NAME);
 #if RUN_MODE == MODE_REPLAY
   Serial.println("===== MODE_REPLAY: 저장된 테스트 데이터를 실시간처럼 흘려보냅니다 =====");
 #elif RUN_MODE == MODE_CHECK
@@ -615,6 +639,7 @@ void setup() {
   Serial.println("===== MODE_RUN: 근전도 모드로 시작합니다 =====");
   Serial.println("- 모드 전환(SW1): 시리얼에서 1 전송, 또는 BOOT 버튼 길게");
   Serial.println("- 다음 동작(SW2): 시리얼에서 2 전송, 또는 BOOT 버튼 짧게 (매크로 모드에서)");
+  Serial.println("- 의수 호밍: SW1 3초 누르기, 또는 시리얼에서 h 전송");
 #endif
 #endif
 

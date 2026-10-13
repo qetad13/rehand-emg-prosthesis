@@ -16,7 +16,7 @@ EMG 손가락 동작 분류: PyTorch 학습 -> ESP32용 C 헤더 내보내기
     emg_model.pt            PyTorch 모델
     emg_model.h             ESP32용 모델 가중치 + 전처리 설정
     emg_test_vectors.h      ESP32 정답 맞추기 테스트 데이터
-  -> emg_model.h, emg_test_vectors.h 는 ../firmware/ 의 세 스케치 폴더에도 자동 복사됨
+  -> ../firmware/ 의 세 스케치 폴더에 emg_model_accurate.h(빠른 모드는 _fast) 이름으로 자동 복사됨
 """
 
 import os
@@ -994,10 +994,12 @@ def run(cfg, verbose=True, export=True):
         vec_h = os.path.join(out_dir, "emg_test_vectors.h")
         export_model_header(model, cfg, sos, norm, model_h, rest_rms)
         export_test_vectors(model, rand, cfg, sos, norm, vec_h)
+        # 스케치 폴더에는 모드별 이름으로 복사 (emg_model.h는 emg_mode.h를 보고 고르는 파일이라 덮어쓰지 않음)
+        suffix = "fast" if cfg.get("fast_mode") else "accurate"
         for d in cfg["sketch_dirs"]:
             if os.path.isdir(d):
-                shutil.copy(model_h, d)
-                shutil.copy(vec_h, d)
+                shutil.copy(model_h, os.path.join(d, f"emg_model_{suffix}.h"))
+                shutil.copy(vec_h, os.path.join(d, f"emg_test_vectors_{suffix}.h"))
                 print(f"  {os.path.basename(d)} 폴더에 .h 파일 복사 완료")
         print(f"\n완료! 결과는 {out_dir} 폴더에 있어요.")
 
@@ -1015,6 +1017,7 @@ FAST_PRESET = {
     "vote_n": 3, "vote_k": 3, "vote_switch_k": 8, "rest_gate": 2.0,
     "vote_release_n": 3, "vote_hold_s": 0.5,
     "out_dir": os.path.join(BASE_DIR, "output_fast"),
+    "fast_mode": True,
 }
 
 

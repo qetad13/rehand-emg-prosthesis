@@ -13,6 +13,7 @@ void setup() {
   delay(3000);
   Serial.println();
   Serial.println("===== EMG golden test =====");
+  Serial.printf("모델: %s  (바꾸려면 emg_mode.h 탭)\n", EMG_MODE_NAME);
 
   int passed = 0;
   unsigned long total_us = 0;

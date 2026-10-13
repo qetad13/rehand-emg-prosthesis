@@ -93,6 +93,7 @@ void setup() {
   delay(3000);
   Serial.println();
   Serial.println("===== 판단 속도 측정 =====");
+  Serial.printf("모델: %s  (바꾸려면 emg_mode.h 탭)\n", EMG_MODE_NAME);
   td_init();
 
   // 테스트 데이터 1초치를 필터에 통과시켜 준비
