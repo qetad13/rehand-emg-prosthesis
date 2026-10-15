@@ -186,9 +186,9 @@ static uint8_t HAND_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // ---------------------------------------------------------------------
 // 모드 전환 (MODE_RUN에서만 동작)
-//   SW1 짧게 : 근전도 모드 <-> 매크로 모드 (손을 뗄 때 바뀜)
-//   SW1 3초  : 의수 호밍 (LED가 빠르게 3번 깜빡이면 전송된 것, 모드는 그대로)
-//   SW2 : 매크로 모드에서 다음 동작으로 넘김
+//   SW1 : 근전도 모드 <-> 매크로 모드 (누르는 순간 바뀜)
+//   SW2 : 매크로 모드에서 다음 동작으로 넘김 (누르는 순간)
+//   SW2 3초 (근전도 모드에서만) : 의수 호밍 (LED가 빠르게 3번 깜빡이면 전송된 것)
 //         (근전도 모드에서는 나중에 '사용자 보정'을 시작할 자리, 지금은 안내만 출력)
 //
 // 스위치가 없어도 아래 두 가지로 대신 누를 수 있습니다.
@@ -205,7 +205,7 @@ static uint8_t HAND_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 #define USE_BOOT_BTN    1     // BOOT 버튼으로 스위치 흉내 (PCB가 오면 0으로 꺼도 됨)
 #define BOOT_BTN_PIN    0     // XIAO ESP32-S3의 BOOT 버튼 (누르면 LOW)
 #define LONG_PRESS_MS   800   // BOOT 버튼을 이 시간 이상 누르면 SW1로 처리
-#define HOMING_PRESS_MS 3000  // SW1을 이 시간 이상 누르고 있으면 의수 호밍
+#define HOMING_PRESS_MS 3000  // 근전도 모드에서 SW2를 이 시간 이상 누르고 있으면 의수 호밍
 #define HAND_CMD_HOMING 20    // 의수 보드로 보내는 호밍 명령 번호
 #define HOMING_SEND_N   3     // 무선은 가끔 빠지므로 여러 번 보냄 (의수 쪽에서 1번만 실행)
 
@@ -262,7 +262,7 @@ static void onSw2Pressed() {
   }
 }
 
-// SW1을 3초 누르고 있을 때: 의수에 호밍 명령 전송
+// 근전도 모드에서 SW2를 3초 누르고 있을 때: 의수에 호밍 명령 전송
 static void onHomingRequested() {
   Serial.println("=== 의수 호밍 요청 전송 ===");
   for (int i = 0; i < HOMING_SEND_N; ++i) {
@@ -338,10 +338,12 @@ static void ctrlTaskFn(void *arg) {
       else if (ch == 'h' || ch == 'H') onHomingRequested();   // 줄바꿈 등 다른 글자는 무시
     }
 #endif
-    const int e1 = sw1.poll(HOMING_PRESS_MS);
-    if (e1 == BTN_LONG) onHomingRequested();
-    else if (e1 == BTN_SHORT) onSw1Pressed();
-    if (sw2.poll(0) == BTN_SHORT) onSw2Pressed();
+    if (sw1.poll(0) == BTN_SHORT) onSw1Pressed();
+    // SW2: 근전도 모드에서는 짧게(뗄 때) = 기존 SW2 동작, 3초 = 호밍
+    //      매크로 모드에서는 지금처럼 누르는 순간 다음 동작
+    const int e2 = sw2.poll(s_ctrlMode == CTRL_EMG ? HOMING_PRESS_MS : 0);
+    if (e2 == BTN_LONG) onHomingRequested();
+    else if (e2 == BTN_SHORT) onSw2Pressed();
     const int ev = boot.poll(LONG_PRESS_MS);
     if (ev == BTN_LONG) onSw1Pressed();
     else if (ev == BTN_SHORT) onSw2Pressed();
@@ -639,7 +641,7 @@ void setup() {
   Serial.println("===== MODE_RUN: 근전도 모드로 시작합니다 =====");
   Serial.println("- 모드 전환(SW1): 시리얼에서 1 전송, 또는 BOOT 버튼 길게");
   Serial.println("- 다음 동작(SW2): 시리얼에서 2 전송, 또는 BOOT 버튼 짧게 (매크로 모드에서)");
-  Serial.println("- 의수 호밍: SW1 3초 누르기, 또는 시리얼에서 h 전송");
+  Serial.println("- 의수 호밍: 근전도 모드에서 SW2 3초 누르기, 또는 시리얼에서 h 전송");
 #endif
 #endif
 
