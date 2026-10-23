@@ -280,4 +280,5 @@ Arduino IDE 설정: 보드 `XIAO_ESP32S3`, `USB CDC On Boot: Enabled`
 `Python` `PyTorch` `NumPy/SciPy` `PySide6` · `C/C++ (Arduino, FreeRTOS)` · `KiCad`
 
 ## 라이선스 / 출처
+- [MIT License](LICENSE) (아래 외부 코드는 각 원본 라이선스를 따름)
 - `firmware/esp32_emg_realtime/EMGFilters.*`: OYMotion Inc. (BSD-3-Clause), 채널별 상태 분리 수정
