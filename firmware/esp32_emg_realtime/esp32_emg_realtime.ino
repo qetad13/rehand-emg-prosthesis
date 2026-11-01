@@ -30,7 +30,7 @@
 #define MODE_RUN    2
 #define MODE_RECORD 3
 #define RUN_MODE    MODE_RUN
-// 정확 / 빠른 / 중간 모드는 여기가 아니라 emg_mode.h 탭의 EMG_FAST_MODE (0 / 1 / 2)로 고릅니다
+// 판단 창 길이와 주기는 학습 때 정해져 emg_model.h에 들어 있습니다 (0.75초 창, 0.1초마다)
 
 // 녹화는 항상 4채널 (CSV의 Ch 00, Ch 01, Ch 02, Ch 03 순서)
 // 판단에는 그중 모델이 쓰는 채널(emg_model.h의 EMG_CHANNEL_IDX)만 사용
@@ -489,9 +489,9 @@ static void inferTaskFn(void *arg) {
 
     static uint32_t s_decisions = 0;
     s_decisions++;
-    const bool printAll = (EMG_STEP_LEN >= 200);                   // 느린 모드: 매번 출력
+    const bool printAll = (EMG_STEP_LEN >= 200);                   // 판단 주기가 0.2초 이상이면 매번 출력
     const bool printNow = printAll || output != lastOutput ||
-                          (s_decisions % (1000 / EMG_STEP_LEN) == 0); // 빠른 모드: 바뀔 때 + 1초마다
+                          (s_decisions % (1000 / EMG_STEP_LEN) == 0); // 그보다 잦으면: 바뀔 때 + 1초마다
     if (printNow) {
     Serial.printf("[%7.2fs] 판단 %-6s %3.0f%% | 출력 %-6s | RMS",
                   s_epochEnd / (float)EMG_FS, EMG_CLASS_NAMES[pred], probs[pred] * 100.0f,
@@ -629,7 +629,7 @@ void setup() {
 #else
   delay(2000);
   Serial.println();
-  Serial.printf("모델: %s  (바꾸려면 emg_mode.h 탭)\n", EMG_MODE_NAME);
+  Serial.printf("모델: %.2f초 창, %dms마다 판단\n", EMG_EPOCH_LEN / (float)EMG_FS, EMG_STEP_LEN * 1000 / EMG_FS);
   Serial.printf("설정: 휴식 게이트 %.1f배, 끄기 Rest %d번 연속, 손가락 바꿀 때 휴식 거치기 %s",
                 EMG_REST_GATE, EMG_VOTE_RELEASE_N, EMG_SWITCH_VIA_REST ? "켬" : "끔");
   if (EMG_SWITCH_VIA_REST && EMG_SWITCH_FREE_MASK) {

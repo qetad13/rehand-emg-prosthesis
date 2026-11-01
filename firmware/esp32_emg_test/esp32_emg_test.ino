@@ -13,7 +13,7 @@ void setup() {
   delay(3000);
   Serial.println();
   Serial.println("===== EMG golden test =====");
-  Serial.printf("모델: %s  (바꾸려면 emg_mode.h 탭)\n", EMG_MODE_NAME);
+  Serial.printf("모델: %.2f초 창, %dms마다 판단\n", EMG_EPOCH_LEN / (float)EMG_FS, EMG_STEP_LEN * 1000 / EMG_FS);
 
   int passed = 0;
   unsigned long total_us = 0;

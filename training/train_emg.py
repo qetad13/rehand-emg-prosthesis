@@ -10,18 +10,15 @@ EMG 손가락 동작 분류: PyTorch 학습 -> ESP32용 C 헤더 내보내기
 
 결과 (output 폴더):
     report.txt              정확도 요약
-    confusion_window.png    1초 단위 혼동행렬
+    confusion_window.png    창 단위 혼동행렬
     realtime_random.png     실시간 흉내 결과 (Random 세션 5개)
     training_curve.png      학습 곡선
     emg_model.pt            PyTorch 모델
     emg_model.h             ESP32용 모델 가중치 + 전처리 설정
     emg_test_vectors.h      ESP32 정답 맞추기 테스트 데이터
-  -> ../firmware/ 의 세 스케치 폴더에 emg_model_accurate.h(빠른 모드는 _fast, 중간 모드는 _mid) 이름으로 자동 복사됨
+  -> ../firmware/ 의 세 스케치 폴더에 emg_model.h, emg_test_vectors.h 로 자동 복사됨
 
-모드별 학습:
-    python train_emg.py          정확 모드 (1초 창, 0.5초마다)   -> output/
-    python train_emg.py --mid    중간 모드 (0.75초 창, 0.1초마다) -> output_mid/
-    python train_emg.py --fast   빠른 모드 (0.5초 창, 0.05초마다) -> output_fast/
+판단 방식: 최근 0.75초 신호를 0.1초마다 판단
 """
 
 import os
@@ -82,27 +79,27 @@ CFG = {
     "warmup_s": 0.5,            # 파일 시작 직후 필터 안정화 구간은 사용 안 함
 
     # ---- 구간 자르기 (반응 지연 고려) ----
-    "epoch_s": 1.0,
-    "step_eval_s": 0.5,         # 검증/테스트/ESP32: 0.5초마다 판단
-    "step_train_s": 0.25,       # 학습 데이터는 더 촘촘히 잘라서 양을 늘림
-    "contract_trim_start_s": 0.25,
+    "epoch_s": 0.75,            # 판단 창: 최근 0.75초
+    "step_eval_s": 0.1,         # 검증/테스트/ESP32: 0.1초마다 판단
+    "step_train_s": 0.1,        # 학습 데이터 자르는 간격
+    "contract_trim_start_s": 0.2,
     "first_rest_trim_start_s": 0.5,
-    "relax_trim_start_s": 0.75,
-    "relax_trim_end_s": 0.25,
-    # "end": 1초 창의 '끝부분' 상태로 라벨 (힘을 빼면 더 빨리 Rest로 바뀌게 학습)
+    "relax_trim_start_s": 0.6,
+    "relax_trim_end_s": 0.2,
+    # "end": 창의 '끝부분' 상태로 라벨 (힘을 빼면 더 빨리 Rest로 바뀌게 학습)
     # "zone": 지시 구간 안에 완전히 들어간 창만 사용
     "label_mode": "end",
-    "label_delay_s": 0.15,      # 사람 반응 지연 보정
-    "label_margin_s": 0.25,     # 동작이 바뀌는 순간 앞뒤 0.25초는 애매해서 제외
+    "label_delay_s": 0.1,       # 사람 반응 지연 보정
+    "label_margin_s": 0.2,      # 동작이 바뀌는 순간 앞뒤 0.2초는 애매해서 제외
 
     # ---- STFT (ESP32에서 똑같이 계산) ----
-    "win": 256,
-    "hop": 32,
-    "nfft": 256,
-    "band_start_bin": 6,        # 6 * 3.906Hz = 23Hz 부터
-    "band_width": 5,            # 주파수 칸 5개씩 묶음
-    "num_bands": 22,            # 22묶음 -> 23 ~ 449Hz
-    "zscore_epoch": True,       # 1초마다 채널별 정규화 (신호 크기 변화에 덜 민감)
+    "win": 128,
+    "hop": 32,                  # 0.75초 창 -> 시간 프레임 20개
+    "nfft": 128,
+    "band_start_bin": 3,        # 3 * 7.8125Hz = 23Hz 부터
+    "band_width": 3,            # 주파수 칸 3개씩 묶음
+    "num_bands": 18,            # 18묶음 -> 23 ~ 445Hz
+    "zscore_epoch": True,       # 창마다 채널별 정규화 (신호 크기 변화에 덜 민감)
 
     # ---- 모델 / 학습 ----
     "widths": [8, 16, 32],
@@ -118,15 +115,15 @@ CFG = {
     # ---- 실시간 흉내 ----
     "vote_n": 3,                # 최근 vote_n번 판단 중
     "vote_k": 2,                # vote_k번 이상 같은 손가락이면 켬 (vote_n = vote_k 이면 "연속 k번")
-    "vote_switch_k": None,      # 켜진 손가락에서 다른 손가락으로 바꿀 때 필요한 연속 횟수 (None이면 vote_k와 같음)
+    "vote_switch_k": 3,         # 켜진 손가락에서 다른 손가락으로 바꿀 때 필요한 연속 횟수 (None이면 vote_k와 같음)
     "switch_via_rest": True,    # True면 손가락 -> 다른 손가락으로 바로 못 바꾸고 반드시 휴식을 거쳐야 함
     "switch_free_classes": ["Fist"],  # 위 규칙의 예외: 이 동작으로는 휴식 없이도 바로 바꿈 (vote_switch_k번 연속이면)
     "vote_release_n": 2,        # 휴식 판단이 이만큼 연속으로 나와야 끔
-    "vote_hold_s": 0.0,         # 출력이 바뀐 뒤 최소 이 시간 동안은 다시 안 바꿈 (깜빡임 방지)
+    "vote_hold_s": 0.3,         # 출력이 바뀐 뒤 최소 이 시간 동안은 다시 안 바꿈 (깜빡임 방지)
     "rest_gate": 2.0,           # 모든 채널 신호가 휴식 기준의 이 배수보다 작으면 무조건 휴식 (0이면 끔)
 
     # ---- ESP32 테스트 데이터 ----
-    "test_chunk_s": 2.0,        # 1초 필터 안정화 + 1초 판단 구간
+    "test_chunk_s": 2.0,        # 필터 안정화 + 판단 구간
 }
 
 
@@ -269,7 +266,7 @@ def load_session(sess, cfg, sos):
 
 
 def make_windows(sess, cfg, step_s):
-    """학습/평가용 1초 창 목록: (시작 샘플, 라벨, 구간 id)"""
+    """학습/평가용 판단 창 목록: (시작 샘플, 라벨, 구간 id)"""
     fs = cfg["fs"]
     L = int(cfg["epoch_s"] * fs)
     step = int(step_s * fs)
@@ -798,7 +795,7 @@ def export_model_header(model, cfg, sos, norm, path, rest_rms=None):
 
 
 def reference_probs_from_chunk(model, chunk_raw, cfg, sos, norm):
-    """ESP32 테스트와 똑같이: 필터를 0부터 시작해 chunk 전체에 걸고, 마지막 1초로 판단"""
+    """ESP32 테스트와 똑같이: 필터를 0부터 시작해 chunk 전체에 걸고, 마지막 판단 창으로 판단"""
     L = int(cfg["epoch_s"] * cfg["fs"])
     filt = sosfilt(sos, chunk_raw.astype(np.float32), axis=0).astype(np.float32)
     X = compute_features(filt[-L:].T[None], cfg)
@@ -931,7 +928,7 @@ def run(cfg, verbose=True, export=True):
     print("  검증:", ", ".join(s["name"] for s in val))
     print("  시험:", ", ".join(s["name"] for s in rand))
 
-    print("[2/6] 1초 구간 자르기 + STFT 계산 중...")
+    print("[2/6] 판단 창 자르기 + STFT 계산 중...")
     Xtr, ytr, _ = windows_to_arrays(train, [make_windows(s, cfg, cfg["step_train_s"]) for s in train], cfg)
     Xva, yva, _ = windows_to_arrays(val, [make_windows(s, cfg, cfg["step_eval_s"]) for s in val], cfg)
     # 시험 채점은 MATLAB과 같은 기준(지시 구간 안에 완전히 들어간 창)으로
@@ -975,10 +972,10 @@ def run(cfg, verbose=True, export=True):
 
     lines = [
         "=== Random 세션(순서 섞은 데이터) 시험 결과 ===",
-        f"1초 단위 정확도 (휴식 포함 {n_cls}종): {win_acc * 100:.1f}%",
-        f"1초 단위 정확도 (휴식 제외 동작 {n_cls - 1}종): {finger_acc * 100:.1f}%",
+        f"창 단위 정확도 (휴식 포함 {n_cls}종): {win_acc * 100:.1f}%",
+        f"창 단위 정확도 (휴식 제외 동작 {n_cls - 1}종): {finger_acc * 100:.1f}%",
         f"한 번 힘주기(수축 구간) 다수결: {seg_acc * 100:.1f}% ({int(np.sum(np.array(seg_true) == np.array(seg_pred)))}/{len(seg_true)})",
-        "클래스별 1초 단위 정답률: " + ", ".join(f"{n} {r * 100:.0f}%" for n, r in zip(names, recall)),
+        "클래스별 창 단위 정답률: " + ", ".join(f"{n} {r * 100:.0f}%" for n, r in zip(names, recall)),
         "",
         f"=== 실시간 흉내 ({cfg['step_eval_s'] * 1000:.0f}ms마다 판단 / 켜기: 최근 {cfg['vote_n']}번 중 {cfg['vote_k']}번, "
         f"바꾸기: {'휴식을 거쳐야 함' if cfg['switch_via_rest'] else '연속 ' + str(cfg['vote_switch_k'] or cfg['vote_k']) + '번'}"
@@ -1006,7 +1003,7 @@ def run(cfg, verbose=True, export=True):
         print("[5/6] 그림 저장 중...")
         with open(os.path.join(out_dir, "report.txt"), "w", encoding="utf-8") as f:
             f.write(report + "\n")
-        plot_confusion(cm, names, f"Random test, 1s windows (acc {win_acc * 100:.1f}%)",
+        plot_confusion(cm, names, f"Random test, {cfg['epoch_s']:g}s windows (acc {win_acc * 100:.1f}%)",
                        os.path.join(out_dir, "confusion_window.png"))
         plot_realtime(rt, cfg, os.path.join(out_dir, "realtime_random.png"))
         plot_history(hist, best_epoch, os.path.join(out_dir, "training_curve.png"))
@@ -1018,12 +1015,10 @@ def run(cfg, verbose=True, export=True):
         vec_h = os.path.join(out_dir, "emg_test_vectors.h")
         export_model_header(model, cfg, sos, norm, model_h, rest_rms)
         export_test_vectors(model, rand, cfg, sos, norm, vec_h)
-        # 스케치 폴더에는 모드별 이름으로 복사 (emg_model.h는 emg_mode.h를 보고 고르는 파일이라 덮어쓰지 않음)
-        suffix = cfg.get("model_suffix") or ("fast" if cfg.get("fast_mode") else "accurate")
         for d in cfg["sketch_dirs"]:
             if os.path.isdir(d):
-                shutil.copy(model_h, os.path.join(d, f"emg_model_{suffix}.h"))
-                shutil.copy(vec_h, os.path.join(d, f"emg_test_vectors_{suffix}.h"))
+                shutil.copy(model_h, os.path.join(d, "emg_model.h"))
+                shutil.copy(vec_h, os.path.join(d, "emg_test_vectors.h"))
                 print(f"  {os.path.basename(d)} 폴더에 .h 파일 복사 완료")
         print(f"\n완료! 결과는 {out_dir} 폴더에 있어요.")
 
@@ -1032,39 +1027,5 @@ def run(cfg, verbose=True, export=True):
             "val_acc": hist["val_acc"][best_epoch - 1], "cm": cm, "rand": rand}
 
 
-# 빠른 모드: 0.5초 창을 50ms마다 판단 (9/24 데이터 실험 기준 제어 지연 중앙값 약 0.3초)
-FAST_PRESET = {
-    "epoch_s": 0.5, "step_eval_s": 0.05, "step_train_s": 0.1,
-    "win": 64, "hop": 32, "nfft": 64, "band_start_bin": 2, "band_width": 2, "num_bands": 13,
-    "label_delay_s": 0.05, "label_margin_s": 0.15, "contract_trim_start_s": 0.15,
-    "relax_trim_start_s": 0.5, "relax_trim_end_s": 0.15,
-    "vote_n": 3, "vote_k": 3, "vote_switch_k": 8, "rest_gate": 2.0,
-    "vote_release_n": 3, "vote_hold_s": 0.5,
-    "out_dir": os.path.join(BASE_DIR, "output_fast"),
-    "fast_mode": True,
-}
-
-# 중간 모드: 0.75초 창을 100ms마다 판단 (정확 모드와 빠른 모드 사이)
-#   128점 STFT (주파수 칸 7.8Hz) -> 3칸씩 18묶음 = 23 ~ 445Hz, 시간 프레임 20개
-MID_PRESET = {
-    "epoch_s": 0.75, "step_eval_s": 0.1, "step_train_s": 0.1,
-    "win": 128, "hop": 32, "nfft": 128, "band_start_bin": 3, "band_width": 3, "num_bands": 18,
-    "label_delay_s": 0.1, "label_margin_s": 0.2, "contract_trim_start_s": 0.2,
-    "relax_trim_start_s": 0.6, "relax_trim_end_s": 0.2,
-    "vote_n": 3, "vote_k": 2, "vote_switch_k": 3, "rest_gate": 2.0,
-    "vote_release_n": 2, "vote_hold_s": 0.3,
-    "out_dir": os.path.join(BASE_DIR, "output_mid"),
-    "model_suffix": "mid",
-}
-
-
 if __name__ == "__main__":
-    import sys
-    cfg = copy.deepcopy(CFG)
-    if "--fast" in sys.argv:
-        cfg.update(FAST_PRESET)
-        print("===== 빠른 모드로 학습 (0.5초 창, 50ms마다 판단) =====")
-    elif "--mid" in sys.argv:
-        cfg.update(MID_PRESET)
-        print("===== 중간 모드로 학습 (0.75초 창, 100ms마다 판단) =====")
-    run(cfg)
+    run(copy.deepcopy(CFG))
