@@ -301,7 +301,9 @@ int emg_vote_update(EmgVote *v, int pred) {
     for (int k = 1; k < EMG_NUM_CLASSES; ++k) {
       if (counts[k] > counts[best]) best = k;
     }
-    if (counts[best] >= need && best != EMG_REST_CLASS && best != v->output) cand = best;
+    // 손가락 -> 손가락은 휴식을 거쳐야 함 (EMG_SWITCH_FREE_MASK에 든 동작, 예: 주먹으로는 바로 바꿈)
+    const int can_switch = resting || !EMG_SWITCH_VIA_REST || ((EMG_SWITCH_FREE_MASK >> best) & 1);
+    if (can_switch && counts[best] >= need && best != EMG_REST_CLASS && best != v->output) cand = best;
   }
 
   if (cand != v->output && v->since >= EMG_VOTE_HOLD_N) {   // 바뀐 지 얼마 안 됐으면 유지

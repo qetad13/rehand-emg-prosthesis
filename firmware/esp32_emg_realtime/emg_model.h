@@ -4,7 +4,13 @@
 
 #include "emg_mode.h"
 
-#if EMG_FAST_MODE
+#if EMG_FAST_MODE == 2
+  #if !__has_include("emg_model_mid.h")
+    #error "emg_model_mid.h가 없습니다. training 폴더에서 python train_emg.py --mid 를 먼저 실행하세요"
+  #endif
+  #include "emg_model_mid.h"
+  #define EMG_MODE_NAME "중간 모드 (0.75초 창, 100ms마다 판단)"
+#elif EMG_FAST_MODE
   #include "emg_model_fast.h"
   #define EMG_MODE_NAME "빠른 모드 (0.5초 창, 50ms마다 판단)"
 #else

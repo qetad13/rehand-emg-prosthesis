@@ -30,7 +30,7 @@
 #define MODE_RUN    2
 #define MODE_RECORD 3
 #define RUN_MODE    MODE_RUN
-// 정확 모드 / 빠른 모드는 여기가 아니라 emg_mode.h 탭의 EMG_FAST_MODE (0 / 1)로 고릅니다
+// 정확 / 빠른 / 중간 모드는 여기가 아니라 emg_mode.h 탭의 EMG_FAST_MODE (0 / 1 / 2)로 고릅니다
 
 // 녹화는 항상 4채널 (CSV의 Ch 00, Ch 01, Ch 02, Ch 03 순서)
 // 판단에는 그중 모델이 쓰는 채널(emg_model.h의 EMG_CHANNEL_IDX)만 사용
@@ -630,6 +630,15 @@ void setup() {
   delay(2000);
   Serial.println();
   Serial.printf("모델: %s  (바꾸려면 emg_mode.h 탭)\n", EMG_MODE_NAME);
+  Serial.printf("설정: 휴식 게이트 %.1f배, 끄기 Rest %d번 연속, 손가락 바꿀 때 휴식 거치기 %s",
+                EMG_REST_GATE, EMG_VOTE_RELEASE_N, EMG_SWITCH_VIA_REST ? "켬" : "끔");
+  if (EMG_SWITCH_VIA_REST && EMG_SWITCH_FREE_MASK) {
+    Serial.print(" (예외:");
+    for (int k = 0; k < EMG_NUM_CLASSES; ++k)
+      if ((EMG_SWITCH_FREE_MASK >> k) & 1) Serial.printf(" %s", EMG_CLASS_NAMES[k]);
+    Serial.print("는 바로)");
+  }
+  Serial.println();
 #if RUN_MODE == MODE_REPLAY
   Serial.println("===== MODE_REPLAY: 저장된 테스트 데이터를 실시간처럼 흘려보냅니다 =====");
 #elif RUN_MODE == MODE_CHECK

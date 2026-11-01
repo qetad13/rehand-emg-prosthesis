@@ -16,7 +16,12 @@ EMG 손가락 동작 분류: PyTorch 학습 -> ESP32용 C 헤더 내보내기
     emg_model.pt            PyTorch 모델
     emg_model.h             ESP32용 모델 가중치 + 전처리 설정
     emg_test_vectors.h      ESP32 정답 맞추기 테스트 데이터
-  -> ../firmware/ 의 세 스케치 폴더에 emg_model_accurate.h(빠른 모드는 _fast) 이름으로 자동 복사됨
+  -> ../firmware/ 의 세 스케치 폴더에 emg_model_accurate.h(빠른 모드는 _fast, 중간 모드는 _mid) 이름으로 자동 복사됨
+
+모드별 학습:
+    python train_emg.py          정확 모드 (1초 창, 0.5초마다)   -> output/
+    python train_emg.py --mid    중간 모드 (0.75초 창, 0.1초마다) -> output_mid/
+    python train_emg.py --fast   빠른 모드 (0.5초 창, 0.05초마다) -> output_fast/
 """
 
 import os
@@ -114,9 +119,11 @@ CFG = {
     "vote_n": 3,                # 최근 vote_n번 판단 중
     "vote_k": 2,                # vote_k번 이상 같은 손가락이면 켬 (vote_n = vote_k 이면 "연속 k번")
     "vote_switch_k": None,      # 켜진 손가락에서 다른 손가락으로 바꿀 때 필요한 연속 횟수 (None이면 vote_k와 같음)
-    "vote_release_n": 1,        # 휴식 판단이 이만큼 연속으로 나와야 끔
+    "switch_via_rest": True,    # True면 손가락 -> 다른 손가락으로 바로 못 바꾸고 반드시 휴식을 거쳐야 함
+    "switch_free_classes": ["Fist"],  # 위 규칙의 예외: 이 동작으로는 휴식 없이도 바로 바꿈 (vote_switch_k번 연속이면)
+    "vote_release_n": 2,        # 휴식 판단이 이만큼 연속으로 나와야 끔
     "vote_hold_s": 0.0,         # 출력이 바뀐 뒤 최소 이 시간 동안은 다시 안 바꿈 (깜빡임 방지)
-    "rest_gate": 0.0,           # 모든 채널 신호가 휴식 기준의 이 배수보다 작으면 무조건 휴식 (0이면 끔)
+    "rest_gate": 2.0,           # 모든 채널 신호가 휴식 기준의 이 배수보다 작으면 무조건 휴식 (0이면 끔)
 
     # ---- ESP32 테스트 데이터 ----
     "test_chunk_s": 2.0,        # 1초 필터 안정화 + 1초 판단 구간
@@ -451,11 +458,14 @@ def confusion(y, p, n):
     return cm
 
 
-def vote_sequence(preds, vote_n, rest_idx, vote_k=None, switch_k=None, release_n=1, hold_n=0):
+def vote_sequence(preds, vote_n, rest_idx, vote_k=None, switch_k=None, release_n=1, hold_n=0,
+                  via_rest=False, free_to=()):
     """켜기는 신중하게, 끄기는 빠르게 (ESP32의 emg_vote_update와 같은 규칙)
     - 이번 판단이 Rest면 바로 Rest
     - 휴식 상태에서: 최근 vote_n번 중 vote_k번 이상 같은 손가락이면 켬
     - 손가락이 켜진 상태에서 다른 손가락으로 바꿀 때: 최근 switch_k번 중 switch_k번(연속) 같아야 바꿈
+      (via_rest=True면 바로 못 바꾸고, 휴식으로 꺼진 뒤에만 다른 손가락을 켤 수 있음.
+       단 free_to에 든 클래스 번호로는 휴식 없이 바로 바꿀 수 있음)
     """
     if vote_k is None:
         vote_k = vote_n // 2 + 1
@@ -480,13 +490,20 @@ def vote_sequence(preds, vote_n, rest_idx, vote_k=None, switch_k=None, release_n
                 hist, need = preds[max(0, i - switch_k + 1):i + 1], switch_k
             vals, cnt = np.unique(hist, return_counts=True)
             best = int(vals[np.argmax(cnt)])
-            if cnt.max() >= need and best != rest_idx and best != prev:
+            if (prev == rest_idx or not via_rest or best in free_to) and \
+                    cnt.max() >= need and best != rest_idx and best != prev:
                 cand = best
         if cand != prev and since >= hold_n:   # 바뀐 지 얼마 안 됐으면 유지
             prev = cand
             since = 0
         out.append(prev)
     return np.array(out)
+
+
+def switch_free_idx(cfg):
+    """휴식 없이 바로 바꿀 수 있는 동작들의 클래스 번호 (데이터에 없는 동작은 무시)"""
+    return tuple(cfg["class_names"].index(n) for n in cfg.get("switch_free_classes", [])
+                 if n in cfg["class_names"])
 
 
 def hold_decisions(cfg):
@@ -530,7 +547,8 @@ def realtime_simulation(model, sessions, cfg, norm, rest_rms=None):
             rms = np.stack([np.sqrt((sess["filt"][t - L:t] ** 2).mean(axis=0)) for t in ends])
             raw_pred = np.where(rest_gate_mask(rms, rest_rms, cfg["rest_gate"]), rest, raw_pred)
         voted = vote_sequence(raw_pred, cfg["vote_n"], rest, cfg["vote_k"], cfg["vote_switch_k"],
-                              cfg["vote_release_n"], hold_decisions(cfg))
+                              cfg["vote_release_n"], hold_decisions(cfg), cfg["switch_via_rest"],
+                              switch_free_idx(cfg))
         results.append({"sess": sess, "ends": ends, "raw": raw_pred, "voted": voted})
     return results
 
@@ -753,6 +771,10 @@ def export_model_header(model, cfg, sos, norm, path, rest_rms=None):
     h.append(f"#define EMG_REST_GATE     {float(cfg['rest_gate'] or 0.0):.3f}f\n")
     h.append(f"#define EMG_VOTE_RELEASE_N {cfg['vote_release_n']}\n")
     h.append(f"#define EMG_VOTE_HOLD_N   {hold_decisions(cfg)}\n")
+    h.append(f"#define EMG_SWITCH_VIA_REST {1 if cfg['switch_via_rest'] else 0}\n")
+    free_mask = sum(1 << i for i in switch_free_idx(cfg))
+    free_names = ", ".join(cfg["class_names"][i] for i in switch_free_idx(cfg)) or "없음"
+    h.append(f"#define EMG_SWITCH_FREE_MASK {free_mask}   // 휴식 없이 바로 바꿀 수 있는 동작: {free_names}\n")
     h.append(f"#define EMG_REST_CLASS    {cfg['class_names'].index('Rest')}\n\n")
     h.append("// 모델이 쓰는 채널 (CSV의 Ch 번호 = 보드의 EMG_PINS 순서)\n")
     h.append("static const int EMG_CHANNEL_IDX[EMG_NUM_CH] = { "
@@ -959,7 +981,9 @@ def run(cfg, verbose=True, export=True):
         "클래스별 1초 단위 정답률: " + ", ".join(f"{n} {r * 100:.0f}%" for n, r in zip(names, recall)),
         "",
         f"=== 실시간 흉내 ({cfg['step_eval_s'] * 1000:.0f}ms마다 판단 / 켜기: 최근 {cfg['vote_n']}번 중 {cfg['vote_k']}번, "
-        f"바꾸기: 연속 {cfg['vote_switch_k'] or cfg['vote_k']}번, 끄기: Rest {cfg['vote_release_n']}번 연속, "
+        f"바꾸기: {'휴식을 거쳐야 함' if cfg['switch_via_rest'] else '연속 ' + str(cfg['vote_switch_k'] or cfg['vote_k']) + '번'}"
+        f"{' (' + '/'.join(cfg.get('switch_free_classes', [])) + '는 바로)' if cfg['switch_via_rest'] and cfg.get('switch_free_classes') else ''}, "
+        f"끄기: Rest {cfg['vote_release_n']}번 연속, "
         f"최소 유지 {cfg['vote_hold_s']}초, 휴식 게이트 {cfg['rest_gate'] or '끔'}) ===",
         f"안정 구간 정확도: {rtm['acc'] * 100:.1f}%",
         f"휴식 중 잘못 움직임 판단 비율: {rtm['false_move_rate'] * 100:.1f}%",
@@ -995,7 +1019,7 @@ def run(cfg, verbose=True, export=True):
         export_model_header(model, cfg, sos, norm, model_h, rest_rms)
         export_test_vectors(model, rand, cfg, sos, norm, vec_h)
         # 스케치 폴더에는 모드별 이름으로 복사 (emg_model.h는 emg_mode.h를 보고 고르는 파일이라 덮어쓰지 않음)
-        suffix = "fast" if cfg.get("fast_mode") else "accurate"
+        suffix = cfg.get("model_suffix") or ("fast" if cfg.get("fast_mode") else "accurate")
         for d in cfg["sketch_dirs"]:
             if os.path.isdir(d):
                 shutil.copy(model_h, os.path.join(d, f"emg_model_{suffix}.h"))
@@ -1020,6 +1044,19 @@ FAST_PRESET = {
     "fast_mode": True,
 }
 
+# 중간 모드: 0.75초 창을 100ms마다 판단 (정확 모드와 빠른 모드 사이)
+#   128점 STFT (주파수 칸 7.8Hz) -> 3칸씩 18묶음 = 23 ~ 445Hz, 시간 프레임 20개
+MID_PRESET = {
+    "epoch_s": 0.75, "step_eval_s": 0.1, "step_train_s": 0.1,
+    "win": 128, "hop": 32, "nfft": 128, "band_start_bin": 3, "band_width": 3, "num_bands": 18,
+    "label_delay_s": 0.1, "label_margin_s": 0.2, "contract_trim_start_s": 0.2,
+    "relax_trim_start_s": 0.6, "relax_trim_end_s": 0.2,
+    "vote_n": 3, "vote_k": 2, "vote_switch_k": 3, "rest_gate": 2.0,
+    "vote_release_n": 2, "vote_hold_s": 0.3,
+    "out_dir": os.path.join(BASE_DIR, "output_mid"),
+    "model_suffix": "mid",
+}
+
 
 if __name__ == "__main__":
     import sys
@@ -1027,4 +1064,7 @@ if __name__ == "__main__":
     if "--fast" in sys.argv:
         cfg.update(FAST_PRESET)
         print("===== 빠른 모드로 학습 (0.5초 창, 50ms마다 판단) =====")
+    elif "--mid" in sys.argv:
+        cfg.update(MID_PRESET)
+        print("===== 중간 모드로 학습 (0.75초 창, 100ms마다 판단) =====")
     run(cfg)

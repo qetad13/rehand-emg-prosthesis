@@ -26,6 +26,8 @@
 #define EMG_REST_GATE     2.000f
 #define EMG_VOTE_RELEASE_N 3
 #define EMG_VOTE_HOLD_N   10
+#define EMG_SWITCH_VIA_REST 1
+#define EMG_SWITCH_FREE_MASK 64   // 휴식 없이 바로 바꿀 수 있는 동작: Fist
 #define EMG_REST_CLASS    0
 
 // 모델이 쓰는 채널 (CSV의 Ch 번호 = 보드의 EMG_PINS 순서)

@@ -4,7 +4,9 @@
 
 #include "emg_mode.h"
 
-#if EMG_FAST_MODE
+#if EMG_FAST_MODE == 2
+  #include "emg_test_vectors_mid.h"
+#elif EMG_FAST_MODE
   #include "emg_test_vectors_fast.h"
 #else
   #include "emg_test_vectors_accurate.h"
