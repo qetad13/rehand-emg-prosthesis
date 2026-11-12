@@ -10,6 +10,7 @@
 //   5. 자세를 표(POSES)로 관리: 동작 추가/수정은 표 한 줄
 //   6. 서보 전압·온도·응답 감시 -> 근전도 보드 LED와 시리얼로 알림
 //   7. 시리얼 입력이 loop()를 최대 1초씩 멈추던 문제(parseInt) 수정
+//   8. 연결 상대 고정: 처음 연결된 근전도 보드의 주소를 저장하고, 다른 보드에서 온 명령은 무시
 //
 // 명령 번호 (예전과 같음)
 //   1~5 엄지/검지/중지/약지/소지, 6 펴기(휴식), 7 주먹, 8 집게
@@ -19,6 +20,7 @@
 //   숫자      그 명령 실행 (예: 7)
 //   s숫자     힘 세기 지정 후 현재 동작에 반영 (예: s30, s0 = 기본)
 //   ?         상태 출력 (자세, 온도, 전압, 전류, 무선)
+//   p         연결 상대 지우기 (다른 근전도 보드로 바꿀 때. 보드의 BOOT 버튼 3초도 같음)
 // =====================================================================
 #include <Arduino.h>
 #include <HLSCL.h>
@@ -50,6 +52,10 @@
 // 서보 전원 전압 감시 (x0.1V). 2S 리튬(7.4V)이면 66 정도를 권장. 0이면 끔
 #define LOW_VOLT_DV      0
 
+// 연결 상대 지우기 버튼: 3초 누르면 저장된 근전도 보드 주소를 지움 (XIAO의 BOOT 버튼 = GPIO0). 안 쓰려면 -1
+#define PAIR_BTN_PIN     0
+#define PAIR_HOLD_MS     3000
+
 // ---------------------------------------------------------------------
 // 무선 링크: 근전도 보드(emg_board_v2 또는 예전 esp32_emg_realtime)와 ESP-NOW로 직접 연결
 // ---------------------------------------------------------------------
@@ -60,6 +66,7 @@ static void linkPoll(uint8_t flags, uint8_t maxTempC, uint8_t volt) { rhHandPoll
 static bool linkTakeCommand(uint8_t *cmd, uint8_t *strength) { return rhHandTakeCommand(cmd, strength); }
 static uint8_t linkStrength() { return rhHandStrength(); }
 static bool linkLost() { return rhHandLinkLost(); }
+static void linkUnpair() { rhHandUnpair(); }
 
 HLSCL hlscl;
 Preferences prefs;
@@ -419,6 +426,13 @@ static void printStatus() {
   Serial.printf("[상태] 명령 %u, 힘 세기 %u, 무선 %s, 상태 읽기 성공 %lu / 실패 %lu\n",
                 g_motion.active ? g_motion.cmd : 0, g_motion.strength, linkLost() ? "끊김" : "수신 중",
                 (unsigned long)gReadOk, (unsigned long)gReadFail);
+  uint8_t mate[6];
+  if (rhHandMate(mate)) {
+    Serial.printf("  연결 상대 %02X:%02X:%02X:%02X:%02X:%02X, 다른 보드에서 와서 무시한 명령 %lu개\n",
+                  mate[0], mate[1], mate[2], mate[3], mate[4], mate[5], (unsigned long)rhHandRejected());
+  } else {
+    Serial.println("  연결 상대 없음 (처음 명령을 보내는 근전도 보드와 연결됨)");
+  }
   Serial.print("  위치(%)  ");
   for (int i = 0; i < 7; ++i) Serial.printf(" %3u", (unsigned)((uint32_t)m.pos[i] * 100 / 65535));
   Serial.print("\n  전류     ");
@@ -434,6 +448,7 @@ static void handleSerialLine(const char *line) {
   while (*line == ' ') ++line;
   if (*line == '\0') return;
   if (*line == '?') { printStatus(); return; }
+  if (*line == 'p' || *line == 'P') { linkUnpair(); return; }
   if (*line == 's' || *line == 'S') {
     int v = atoi(line + 1);
     if (v < 0) v = 0;
@@ -447,8 +462,26 @@ static void handleSerialLine(const char *line) {
   if ((command >= 1 && command <= 8) || (command >= 11 && command <= 24)) {
     executeHandCommand((uint8_t)command, g_serialStrength, false);
   } else {
-    Serial.println("[SERIAL] 명령: 1~8, 11~24 / s숫자 = 힘 세기 / ? = 상태");
+    Serial.println("[SERIAL] 명령: 1~8, 11~24 / s숫자 = 힘 세기 / ? = 상태 / p = 연결 상대 지우기");
   }
+}
+
+// BOOT 버튼을 3초 누르면 연결 상대를 지움 (한 번 누를 때 한 번만)
+static void pairButtonPoll() {
+#if PAIR_BTN_PIN >= 0
+  static uint32_t downMs = 0;
+  static bool fired = false;
+  if (digitalRead(PAIR_BTN_PIN) == LOW) {
+    if (downMs == 0) downMs = millis() | 1;
+    if (!fired && millis() - downMs >= PAIR_HOLD_MS) {
+      fired = true;
+      linkUnpair();
+    }
+  } else {
+    downMs = 0;
+    fired = false;
+  }
+#endif
 }
 
 static void serialPoll() {
@@ -498,6 +531,9 @@ void setup() {
   gLastReadOkMs = millis();
   xTaskCreatePinnedToCore(TaskSyncRead_Core1, "SyncRead", 4096, NULL, 1, NULL, 1);
 
+#if PAIR_BTN_PIN >= 0
+  pinMode(PAIR_BTN_PIN, INPUT_PULLUP);
+#endif
   linkBegin();
 }
 
@@ -506,6 +542,7 @@ void loop() {
   uint8_t maxTempC = 0, minVolt = 0;
   const uint8_t flags = handStatusFlags(&maxTempC, &minVolt);
   linkPoll(flags, maxTempC, minVolt);
+  pairButtonPoll();
 
   // 이상 상태는 바뀔 때만 한 번씩 출력
   static uint8_t lastFlags = 0;
