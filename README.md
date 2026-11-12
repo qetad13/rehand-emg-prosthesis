@@ -35,8 +35,9 @@ PCB 설계 → 데이터 수집 GUI → PyTorch 학습 → C 코드 자동 생�
 >
 > | 브랜치 | 판단 방식 | 내용 |
 > |---|---|---|
+> | `main` · [`v2-streaming-tcn`](https://github.com/qetad13/rehand-emg-prosthesis/tree/v2-streaming-tcn) | 둘 다 | 기존 버전 위에 v2 추가 (지금 보고 있는 내용) |
 > | [`v1-stft-cnn`](https://github.com/qetad13/rehand-emg-prosthesis/tree/v1-stft-cnn) | STFT 스펙트로그램 + 2D CNN | 기존 버전만 있음 |
-> | [`v2-streaming-tcn`](https://github.com/qetad13/rehand-emg-prosthesis/tree/v2-streaming-tcn) | 스트리밍 특징 + 1D CNN(TCN) | 기존 버전 위에 v2 추가 (이 브랜치) |
+> | [`v2-only`](https://github.com/qetad13/rehand-emg-prosthesis/tree/v2-only) | 스트리밍 특징 + 1D CNN(TCN) | v2 파일만 있음 |
 
 ---
 
