@@ -726,8 +726,10 @@ def run(cfg, cfg2, do_cv=False, export=True):
         base.plot_confusion(ev["cm"], names, f"Random test, v2 (acc {ev['win_acc'] * 100:.1f}%)",
                             os.path.join(out, "confusion_window.png"))
         base.plot_realtime(ev["results"], cfg, os.path.join(out, "realtime_random.png"))
-        torch.save({"state_dict": model.state_dict(), "cfg": cfg, "cfg2": cfg2, "norm": norm, "sos": sos,
-                    "rest_pow": rest_pow}, os.path.join(out, "emg2_model.pt"))
+        # 폴더 경로는 PC마다 다르므로 저장하지 않음 (host_check.py가 실행하는 PC의 경로를 다시 채움)
+        no_paths = lambda d: {k: v for k, v in d.items() if not k.endswith(("_dir", "_dirs"))}
+        torch.save({"state_dict": model.state_dict(), "cfg": no_paths(cfg), "cfg2": no_paths(cfg2), "norm": norm,
+                    "sos": sos, "rest_pow": rest_pow}, os.path.join(out, "emg2_model.pt"))
         model_h = os.path.join(out, "emg2_model.h")
         vec_h = os.path.join(out, "emg2_test_vectors.h")
         export_model_header(model, cfg, cfg2, sos, norm, rest_pow, cal_logamp, strength_full, model_h)
