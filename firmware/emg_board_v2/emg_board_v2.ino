@@ -3,7 +3,7 @@
 //
 // 녹화 / 센서 점검 / 실시간 판단 / 재생 / 자가 점검을 이 스케치 하나로 합니다. (RUN_MODE로 선택)
 // 녹화(MODE_RECORD)와 판단(MODE_RUN)이 같은 readEmgInput()을 쓰기 때문에 학습 데이터와 실시간 입력이 똑같습니다.
-// 녹화 형식은 예전(esp32_emg_realtime)과 같아서, 예전 녹화 데이터와 수집 GUI를 그대로 씁니다.
+// 녹화 형식은 예전(v1-stft-cnn 브랜치의 esp32_emg_realtime)과 같아서, 예전 녹화 데이터와 수집 GUI를 그대로 씁니다.
 //
 // 예전 스케치(esp32_emg_realtime)와 달라진 점
 //   1. 판단 방식 v2 (emg2.*): 0.75초 창 STFT+CNN -> 25ms마다 스트리밍 특징 + 작은 TCN

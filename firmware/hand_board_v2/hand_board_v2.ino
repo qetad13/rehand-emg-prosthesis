@@ -51,7 +51,7 @@
 #define LOW_VOLT_DV      0
 
 // ---------------------------------------------------------------------
-// 무선 링크: 근전도 보드(emg_board_v2 또는 예전 esp32_emg_realtime)와 ESP-NOW로 직접 연결
+// 무선 링크: 근전도 보드(emg_board_v2 또는 v1-stft-cnn 브랜치의 esp32_emg_realtime)와 ESP-NOW로 직접 연결
 // ---------------------------------------------------------------------
 #define REHAND_ROLE_HAND
 #include "RehandLink.h"

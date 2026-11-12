@@ -5,9 +5,9 @@ EMG 손가락 동작 분류 v2: 스트리밍 특징 + 작은 1D 시간 합성곱
     python train_v2.py            학습 + Random 시험 + 내보내기
     python train_v2.py --cv       위에 더해 고정 순서 세션 15개로 5겹 교차검증도 함 (약 5분 더 걸림)
 
-데이터 폴더와 CSV 형식은 train_emg.py와 같습니다 (data/Fixed, data/Random).
+데이터: data/Fixed (고정 순서, 학습/교차검증), data/Random (무작위 순서, 시험 전용). 읽기는 emg_data.py
 
-v1(train_emg.py)과 달라진 점
+v1(STFT + 2D CNN, v1-stft-cnn 브랜치)과 달라진 점
   - 입력: 0.75초 창의 STFT 그림 대신, 25ms마다 계산하는 특징 22개
       채널별 로그 진폭(쉴 때 대비) / 주파수 비 2개 / 영교차율 + 채널 쌍 상관 6개
       (v1은 창마다 채널별로 크기를 정규화해서 "어느 채널이 얼마나 큰지"를 버렸는데,
@@ -35,7 +35,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import train_emg as base      # 데이터 읽기, 필터, 구간 정보, 실시간 지표는 v1 것을 그대로 사용
+import emg_data as base       # 데이터 읽기, 필터, 구간 정보, 실시간 지표
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -167,7 +167,7 @@ def rest_power(sessions):
 # =====================================================================
 def emg_events(sess, cfg):
     """수축 구간마다 (지시 시작, 지시 끝, 라벨, 근전도 시작, 근전도 끝). 못 찾으면 None
-    (train_emg.realtime_metrics가 제어 지연을 잴 때 쓰는 정의와 같음)"""
+    (emg_data.realtime_metrics가 제어 지연을 잴 때 쓰는 정의와 같음)"""
     rest = cfg["class_names"].index("Rest")
     env = np.sqrt(np.convolve((sess["filt"] ** 2).max(axis=1), np.ones(100) / 100, mode="same"))
     relax = [(s, e) for (s, e, lab, kind, k) in sess["zones"] if kind == "relax" and sess["valid"][s:e].all()]
@@ -726,8 +726,10 @@ def run(cfg, cfg2, do_cv=False, export=True):
         base.plot_confusion(ev["cm"], names, f"Random test, v2 (acc {ev['win_acc'] * 100:.1f}%)",
                             os.path.join(out, "confusion_window.png"))
         base.plot_realtime(ev["results"], cfg, os.path.join(out, "realtime_random.png"))
-        torch.save({"state_dict": model.state_dict(), "cfg": cfg, "cfg2": cfg2, "norm": norm, "sos": sos,
-                    "rest_pow": rest_pow}, os.path.join(out, "emg2_model.pt"))
+        # 폴더 경로는 PC마다 다르므로 저장하지 않음 (host_check.py가 실행하는 PC의 경로를 다시 채움)
+        no_paths = lambda d: {k: v for k, v in d.items() if not k.endswith(("_dir", "_dirs"))}
+        torch.save({"state_dict": model.state_dict(), "cfg": no_paths(cfg), "cfg2": no_paths(cfg2), "norm": norm,
+                    "sos": sos, "rest_pow": rest_pow}, os.path.join(out, "emg2_model.pt"))
         model_h = os.path.join(out, "emg2_model.h")
         vec_h = os.path.join(out, "emg2_test_vectors.h")
         export_model_header(model, cfg, cfg2, sos, norm, rest_pow, cal_logamp, strength_full, model_h)

@@ -20,7 +20,7 @@ import subprocess
 import numpy as np
 import torch
 
-import train_emg as base
+import emg_data as base
 import train_v2 as v2
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -96,6 +96,7 @@ def main():
         raise SystemExit("output_v2/emg2_model.pt 가 없습니다. 먼저 python train_v2.py 를 실행하세요.")
     ck = torch.load(ckpt_path, weights_only=False)      # 직접 만든 파일
     cfg, cfg2, norm, rest_pow = ck["cfg"], ck["cfg2"], ck["norm"], ck["rest_pow"]
+    cfg.update({k: v for k, v in base.CFG.items() if k.endswith("_dir")})   # 데이터 폴더는 이 PC의 경로로
     names = cfg["class_names"]
     n_cls, n_ch = len(names), len(cfg["channels"])
     model = v2.build_model(len(norm[0]), n_cls, cfg2)

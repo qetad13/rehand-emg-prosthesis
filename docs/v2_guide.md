@@ -1,11 +1,13 @@
 # ReHand v2 사용 안내
 
-v2는 기존 코드를 지우지 않고 **옆에 새로 추가**한 것입니다. 문제가 생기면 예전 스케치(`esp32_emg_realtime`, 예전 `rehand.ino`)를 다시 올리면 그대로 돌아갑니다.
+이 브랜치(`v2-only`)에는 v2 파일만 있습니다. 예전 방식(STFT + CNN)은
+[`v1-stft-cnn` 브랜치](https://github.com/qetad13/rehand-emg-prosthesis/tree/v1-stft-cnn)에 있고,
+문제가 생기면 그 브랜치의 `esp32_emg_realtime` 스케치와 예전 `rehand.ino`를 다시 올리면 그대로 돌아갑니다.
 
-| | 예전 | v2 |
+| | 예전 (`v1-stft-cnn` 브랜치) | v2 (이 브랜치) |
 |---|---|---|
 | 근전도 보드 | `firmware/esp32_emg_realtime` | `firmware/emg_board_v2` |
-| 의수 보드 | `rehand.ino` (zip) | `firmware/hand_board_v2` |
+| 의수 보드 | `rehand.ino` | `firmware/hand_board_v2` |
 | 학습 | `training/train_emg.py` | `training/train_v2.py` |
 | PC에서 펌웨어 검증 | (보드에서만 가능) | `training/host_check.py` |
 

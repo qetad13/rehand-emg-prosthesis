@@ -1,6 +1,7 @@
 # ReHand v2 결과와 실험 기록
 
 같은 녹화 데이터(고정 순서 15세션 + Random 5세션)로 판단 방식을 다시 만들고, 예전 방식(v1)과 같은 기준으로 비교한 내용입니다.
+v1 코드는 [`v1-stft-cnn` 브랜치](https://github.com/qetad13/rehand-emg-prosthesis/tree/v1-stft-cnn)에 있습니다.
 사용 방법은 [v2_guide.md](v2_guide.md)에 있습니다.
 
 ## 1. 한눈에 보기
@@ -157,8 +158,8 @@ v2는 확률을 평활(계수 0.5)한 값이 **0.8 이상**일 때만 켭니다.
 
 ## 6. 비교할 때 알아 둘 점
 
-- v1의 Random 수치는 기존 `training/output/report.txt`의 값입니다 (13세션 학습 + 2세션 검증).
+- v1의 Random 수치는 `v1-stft-cnn` 브랜치의 `training/output/report.txt` 값입니다 (13세션 학습 + 2세션 검증).
   v2는 조기 종료를 쓰지 않아 검증 세션이 필요 없으므로 15세션을 모두 학습에 썼습니다.
 - v2의 설정(특징, 모델, 문턱, 증강)은 교차검증만으로 골랐고 Random은 확정 뒤에 쟀습니다.
   다만 개발 중 Random 결과를 한 번 본 뒤에 힘 증강을 추가했습니다(선택 자체는 교차검증 기준).
-- 지연·오출력 지표는 v1의 `realtime_metrics`를 그대로 썼습니다. 실제 보드에서는 여기에 무선 전송과 서보 반응 시간이 더해집니다.
+- 지연·오출력 지표는 v1의 `realtime_metrics`를 그대로 썼습니다 (`training/emg_data.py`). 실제 보드에서는 여기에 무선 전송과 서보 반응 시간이 더해집니다.
