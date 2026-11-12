@@ -184,6 +184,7 @@ rehand-emg-prosthesis/
   - "네 손가락 먼저 → 엄지" 순서를 기다리는 동안에도 명령과 무선 수신이 멈추지 않음
   - 호밍을 별도 태스크로 분리, 자세를 표 한 줄로 추가·수정
   - 서보 온도 · 전압 · 응답을 감시해 근전도 보드에 알림
+  - 처음 연결된 근전도 보드의 주소를 저장하고 다른 송신기의 명령은 무시 (시리얼 `p` 또는 BOOT 3초로 해제, 암호화는 없음)
 - **PC 대조 검증** ([training/host_check.py](training/host_check.py))
   - 펌웨어의 `emg2.cpp`를 PC에서 그대로 컴파일해 Random 세션 전체(32,014프레임)를 PyTorch와 비교: 확률 차이 최대 8.3e-07, 최종 출력 차이 0
 
@@ -226,6 +227,7 @@ Arduino IDE 설정: 보드 `XIAO_ESP32S3`, `USB CDC On Boot: Enabled`
 
 | 날짜 | 변경 내용 |
 |---|---|
+| 2026-11-12 | **연결 상대 고정**: 의수가 처음 연결된 근전도 보드의 주소를 저장하고 다른 송신기의 명령은 무시. 의수 시리얼 `p` 또는 BOOT 3초로 해제. 암호화는 아직 없음 ([#1](https://github.com/qetad13/rehand-emg-prosthesis/issues/1)) |
 | 2026-11-12 | **v2**: 스트리밍 특징 + TCN 판단 방식(`train_v2.py`, `emg_board_v2`), 의수 보드 v2(`hand_board_v2`: 힘 세기 비례 제어, 양방향 연결, 호밍 태스크), 사용자 보정, 잠금 모드, PC 대조 검증(`host_check.py`) |
 | 2026-09-30 | **PCB v2**: XIAO SMD 실장, 배터리 커넥터, 버튼 2개(풀업 + RC 디바운스) 추가 |
 
