@@ -14,6 +14,30 @@ PCB 설계 → 데이터 수집 GUI → PyTorch 학습 → C 코드 자동 생�
 | 통신 | ESP-NOW (근전도 보드 → 의수 보드, 2바이트 {명령 번호, 힘 세기}) |
 | 성능 | 미사용 순서 세션 기준 창 단위 정확도 **96.4%**, 실시간 제어 지연 중앙값 **356 ms** (0.75초 창, 100 ms마다 판단) |
 
+> ### v2 (2026-11) — 판단 방식·의수 펌웨어 개선판
+> 같은 녹화 데이터로 판단 방식을 다시 만들었습니다. 기존 코드는 그대로 두고 옆에 추가했습니다.
+>
+> | Random 5세션 (학습 미사용) | v1 (아래 본문) | v2 |
+> |---|---|---|
+> | 창 단위 정확도 | 96.4% | **98.7%** |
+> | 제어 지연 (중앙값) | 356 ms | **226 ms** |
+> | 해제 (중앙값) | 169 ms | **94 ms** |
+> | 인식 성공 / 놓침 · 오출력 | 34 / 1 · 3회 | 35 / 0 · 1회 |
+> | 1초당 곱셈 수 | 약 300만 | 약 23만 |
+>
+> - 25 ms마다 계산하는 특징 22개(채널별 로그 진폭·주파수 비·영교차율·채널 상관) + 과거만 보는 1D 시간 합성곱(TCN)
+> - 의수: 힘 세기 비례 속도·쥐는 힘, 멈추지 않는 동작 순서, 호밍 태스크 분리, 서보 상태 감시
+> - 근전도 보드: 의수와 양방향 연결, 의수가 동작을 보여주는 사용자 보정(약 40초), 잠금 모드
+> - 펌웨어 C 코드를 PC에서 그대로 컴파일해 PyTorch와 3만 2천 프레임 대조 (`training/host_check.py`)
+> - **실제 보드·의수에서의 동작 시험은 아직 하지 않았습니다.**
+>
+> 사용 방법: [docs/v2_guide.md](docs/v2_guide.md) · 실험과 결과: [docs/v2_results.md](docs/v2_results.md)
+>
+> | 브랜치 | 판단 방식 | 내용 |
+> |---|---|---|
+> | [`v1-stft-cnn`](https://github.com/qetad13/rehand-emg-prosthesis/tree/v1-stft-cnn) | STFT 스펙트로그램 + 2D CNN | 기존 버전만 있음 |
+> | [`v2-streaming-tcn`](https://github.com/qetad13/rehand-emg-prosthesis/tree/v2-streaming-tcn) | 스트리밍 특징 + 1D CNN(TCN) | 기존 버전 위에 v2 추가 (이 브랜치) |
+
 ---
 
 ## 시스템 구조
@@ -67,14 +91,21 @@ rehand-emg-prosthesis/
 │  └─ emg_collector_v4.py
 ├─ training/                 학습 + ESP32용 C 헤더 생성
 │  ├─ train_emg.py           python train_emg.py
+│  ├─ train_v2.py            v2 학습: python train_v2.py --cv
+│  ├─ host_check.py          v2 펌웨어 C 코드를 PC에서 PyTorch와 대조
+│  ├─ output_v2/             v2 학습 결과
 │  ├─ data/Fixed/            고정 순서 세션 15개 (학습/검증)
 │  ├─ data/Random/           무작위 순서 세션 5개 (테스트 전용)
 │  └─ output/                학습 결과 (report, 그림, 모델)
 ├─ firmware/                 Arduino (XIAO ESP32-S3)
+│  ├─ emg_board_v2/          v2 근전도 보드: 녹화 · 점검 · 실시간 판단 · 재생 · 자가 점검
+│  ├─ hand_board_v2/         v2 의수 보드
 │  ├─ esp32_emg_realtime/    녹화 · 센서 점검 · 실시간 판단 · 재생 (모드 전환)
 │  ├─ esp32_emg_test/        PC ↔ ESP32 결과 일치 검증 (골든 테스트)
 │  └─ esp32_emg_bench/       단계별 연산 시간 측정 (STFT+CNN vs 시간영역 특징)
 └─ docs/
+   ├─ v2_guide.md            v2 사용 안내
+   ├─ v2_results.md          v2 결과와 실험 기록
    ├─ hand_board_patch.md    의수 보드 ESP-NOW 수신부 수정 내역
    └─ images/                결과 그림
 ```
@@ -269,6 +300,7 @@ Arduino IDE 설정: 보드 `XIAO_ESP32S3`, `USB CDC On Boot: Enabled`
 
 | 날짜 | 변경 내용 |
 |---|---|
+| 2026-11-12 | **v2 추가**: 스트리밍 특징 + TCN 판단 방식(`train_v2.py`, `emg_board_v2`), 의수 보드 v2(`hand_board_v2`: 힘 세기 비례 제어, 양방향 연결, 호밍 태스크), 사용자 보정, 잠금 모드, PC 대조 검증(`host_check.py`). 기존 v1 코드는 그대로 유지 |
 | 2026-11-02 | **판단 방식 하나로 통일**: 0.75초 창 · 100 ms 주기만 사용. 정확/빠른 모드와 `emg_mode.h` 삭제, 학습은 `python train_emg.py` 하나로 |
 | 2026-10-27 | **출력 규칙**: 손가락 → 다른 손가락은 휴식을 거쳐야 바뀜 (주먹은 예외로 바로), 휴식 게이트 2.0 · 끄기 휴식 2번 연속, 시작 시 설정 출력 |
 | 2026-10-15 | **호밍 버튼 변경**: 의수 호밍을 SW1 3초에서 근전도 모드의 SW2 3초로 옮김. SW1은 다시 누르는 순간 모드가 바뀌도록 되돌리고, 매크로 모드의 SW2는 그대로 누르는 순간 다음 동작 |

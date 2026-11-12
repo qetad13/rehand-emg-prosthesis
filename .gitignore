@@ -5,3 +5,6 @@ __pycache__/
 *-backups/
 .history/
 fp-info-cache
+
+# PC 검증용 빌드 결과 (host_check.py)
+training/output_v2/host_build/
