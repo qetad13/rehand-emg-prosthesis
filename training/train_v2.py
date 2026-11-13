@@ -4,6 +4,8 @@ EMG 손가락 동작 분류 v2: 스트리밍 특징 + 작은 1D 시간 합성곱
 실행 방법 (VS Code 터미널):
     python train_v2.py            학습 + Random 시험 + 내보내기
     python train_v2.py --cv       위에 더해 고정 순서 세션 15개로 5겹 교차검증도 함 (약 5분 더 걸림)
+    python train_v2.py --extra-data 폴더      다른 날·다른 사람 녹화(폴더/Fixed, 폴더/Random)도 함께 학습
+    python train_v2.py --adapt-test 폴더      그 폴더는 학습에 쓰지 않고, 사용자 보정으로 얼마나 회복되는지만 확인
 
 데이터 폴더와 CSV 형식은 train_emg.py와 같습니다 (data/Fixed, data/Random).
 
@@ -30,6 +32,7 @@ import sys
 import copy
 import shutil
 import argparse
+import zlib
 
 import numpy as np
 import torch
@@ -87,6 +90,16 @@ CFG2 = {
     "rest_gate": 1.5,           # 신호 크기가 쉴 때의 이 배수보다 작으면 무조건 휴식 (0이면 끔)
     "warmup_frames": 20,        # 전원을 켠 직후 필터가 안정될 때까지 (0.5초) 무조건 휴식
     "strength_hops": 8,         # 힘 세기를 재는 구간 (8 hop = 0.2초)
+
+    # ---- 사용자 보정 때 마지막 층 다시 맞추기 (보드에서 계산, emg2_adapt_fc와 같음) ----
+    # 착용 위치가 달라지거나 다른 사람이 쓰면 채널 크기뿐 아니라 동작별 채널 패턴이 바뀌어서,
+    # 보정 녹화(동작마다 2초)로 마지막 전결합층만 다시 맞춤. 앞의 합성곱층은 그대로
+    "adapt_every": 2,           # 보정 녹화에서 이 간격으로 프레임을 씀 (메모리 절약)
+    "adapt_steps": 300,         # Adam 반복 횟수
+    "adapt_lr": 0.05,
+    "adapt_l2": 1e-3,           # 원래 가중치 쪽으로 당기는 정도 (보정에 없는 동작이 망가지지 않게)
+    "adapt_min_acc": 0.8,       # 다시 맞춘 뒤에도 보정 녹화를 이만큼도 못 맞히면 적용하지 않음
+    "adapt_need_acc": 0.85,     # 지금 모델이 보정 녹화를 이만큼 이상 맞히면 다시 맞추지 않음 (같은 착용이면 오히려 손해)
 
     # ---- ESP32 테스트 데이터 ----
     "test_chunk_s": 2.0,
@@ -286,6 +299,7 @@ def train_model(data, n_classes, n_ch, cfg2, seed, verbose=False):
     y_all = np.concatenate([d["y"][d["m"]] for d in data])
     counts = np.bincount(y_all, minlength=n_classes).astype(np.float32)
     weights = (counts.sum() / (n_classes * np.maximum(counts, 1))) ** 0.5     # 휴식이 많은 것을 절반쯤 보정
+    weights = np.where(counts > 0, weights, 0).astype(np.float32)               # 데이터에 없는 동작은 학습하지 않음
 
     model = build_model(data[0]["X"].shape[1], n_classes, cfg2)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg2["lr"], weight_decay=cfg2["weight_decay"])
@@ -487,12 +501,93 @@ def calibration_simulation(model, norm, data, cfg, cfg2, cal_logamp, n_ch, lo, h
 
 
 # =====================================================================
+# 사용자 보정: 마지막 층 다시 맞추기 (펌웨어 emg2_adapt_fc와 같은 계산)
+# =====================================================================
+def embed_sequence(model, norm, x):
+    """프레임마다 마지막 층 바로 앞의 값 (펌웨어 Emg2Back.embed)"""
+    with torch.no_grad():
+        h = torch.from_numpy(((x - norm[0]) / norm[1]).astype(np.float32))[None].transpose(1, 2)
+        for conv, (w, k, d) in zip(model.convs, model.spec):
+            h = torch.relu(conv(nn.functional.pad(h, ((k - 1) * d, 0))))
+        return h.transpose(1, 2)[0].numpy().astype(np.float32)
+
+
+def adapt_fc(w0, b0, H, Y, n_cls, cfg2):
+    """보정 녹화의 (임베딩, 동작) 쌍으로 마지막 층을 다시 맞춤. 전체 배치 Adam, float32.
+    손실 = 동작별 가중 교차 엔트로피 + adapt_l2 * |W - W0|^2.  돌려주는 값: (W, b, 보정 녹화 정답률)"""
+    f = np.float32
+    H = H.astype(f)
+    W, B = w0.astype(f).copy(), b0.astype(f).copy()
+    cnt = np.bincount(Y, minlength=n_cls).astype(f)
+    cw = np.where(cnt > 0, np.sqrt(cnt.sum() / (n_cls * np.maximum(cnt, 1))), 0).astype(f)
+    sw = cw[Y]
+    sw = (sw / sw.sum()).astype(f)
+    mW, vW = np.zeros_like(W), np.zeros_like(W)
+    mB, vB = np.zeros_like(B), np.zeros_like(B)
+    b1, b2, eps, lr, l2 = f(0.9), f(0.999), f(1e-8), f(cfg2["adapt_lr"]), f(cfg2["adapt_l2"])
+    onehot = np.eye(n_cls, dtype=f)[Y]
+    for t in range(1, cfg2["adapt_steps"] + 1):
+        z = H @ W.T + B
+        z = z - z.max(axis=1, keepdims=True)
+        p = np.exp(z)
+        p /= p.sum(axis=1, keepdims=True)
+        G = ((p - onehot) * sw[:, None]).astype(f)
+        gW = (G.T @ H + f(2) * l2 * (W - w0)).astype(f)
+        gB = G.sum(axis=0).astype(f)
+        c1, c2 = f(1) - b1 ** t, f(1) - b2 ** t
+        for P, g, m, v in ((W, gW, mW, vW), (B, gB, mB, vB)):
+            m *= b1; m += (f(1) - b1) * g
+            v *= b2; v += (f(1) - b2) * g * g
+            P -= lr * (m / c1) / (np.sqrt(v / c2) + eps)
+    acc = float(((H @ W.T + B).argmax(axis=1) == Y).mean())
+    return W, B, acc
+
+
+def cal_frames(d, cfg, cfg2):
+    """녹화 세션에서 보드의 보정 녹화를 흉내 낸 프레임: 동작마다 근전도가 올라온 뒤 0.25~2.25초(2초),
+    휴식은 구간 뒤쪽 프레임 (보정의 휴식 1초 x 7번). 보드처럼 adapt_every 간격으로"""
+    rest = cfg["class_names"].index("Rest")
+    every = cfg2["adapt_every"]
+    sel = np.zeros(len(d["y"]), bool)
+    for g in range(len(cfg["class_names"])):
+        idx = np.flatnonzero((d["y"] == g) & d["m"])
+        if g == rest:
+            sel[idx[-40 * 7:][::every]] = True
+        else:
+            sel[idx[10:90][::every]] = True
+    return sel
+
+
+def adaptation_simulation(model, norm, cal_d, test, cfg, cfg2):
+    """cal_d 세션으로 보정(마지막 층 다시 맞추기)한 뒤 test 세션 평가. 돌려주는 값: (보정 전, 보정 후, 보정 녹화 정답률)"""
+    sel = cal_frames(cal_d, cfg, cfg2)
+    H = embed_sequence(model, norm, cal_d["X"])[sel]
+    W, B, acc = adapt_fc(model.fc.weight.detach().numpy(), model.fc.bias.detach().numpy(), H, cal_d["y"][sel],
+                         len(cfg["class_names"]), cfg2)
+    before = evaluate([(d, predict_probs(model, norm, d["X"])) for d in test], cfg, cfg2, model.rf)
+    adapted = copy.deepcopy(model)
+    with torch.no_grad():
+        adapted.fc.weight.copy_(torch.from_numpy(W))
+        adapted.fc.bias.copy_(torch.from_numpy(B))
+    after = evaluate([(d, predict_probs(adapted, norm, d["X"])) for d in test], cfg, cfg2, model.rf)
+    return before, after, acc
+
+
+# =====================================================================
 # ESP32용 내보내기
 # =====================================================================
 def count_ops(model, n_classes):
     ops = sum(c.weight.numel() for c in model.convs) + model.fc.weight.numel()
     params = sum(p.numel() for p in model.parameters())
     return ops, params
+
+
+def model_id(model, norm):
+    """가중치로 만든 32비트 값. 보드에 저장된 보정(다시 맞춘 마지막 층)이 지금 모델 것인지 확인할 때 씀"""
+    crc = 0
+    for t in list(model.state_dict().values()) + [torch.from_numpy(norm[0]), torch.from_numpy(norm[1])]:
+        crc = zlib.crc32(t.detach().numpy().astype(np.float32).tobytes(), crc)
+    return crc & 0xFFFFFFFF
 
 
 def export_model_header(model, cfg, cfg2, sos, norm, rest_pow, cal_logamp, strength_full, path):
@@ -536,6 +631,14 @@ def export_model_header(model, cfg, cfg2, sos, norm, rest_pow, cal_logamp, stren
          f"#define EMG2_SW_N          {cfg2['sw_n']}\n",
          f"#define EMG2_SWITCH_FREE_MASK {free_mask}   // 휴식 없이 바로 바꿀 수 있는 동작: {free_names}\n",
          f"#define EMG2_REST_GATE     {float(cfg2['rest_gate'] or 0.0):.3f}f\n\n",
+         "// 사용자 보정 때 마지막 층 다시 맞추기 (emg2_adapt_fc, train_v2.py의 adapt_fc와 같음)\n",
+         f"#define EMG2_MODEL_ID      0x{model_id(model, norm):08X}UL   // 가중치가 바뀌면 달라짐 (저장된 보정이 이 모델 것인지 확인)\n",
+         f"#define EMG2_ADAPT_EVERY   {cfg2['adapt_every']}\n",
+         f"#define EMG2_ADAPT_STEPS   {cfg2['adapt_steps']}\n",
+         f"#define EMG2_ADAPT_LR      {cfg2['adapt_lr']:.6g}f\n",
+         f"#define EMG2_ADAPT_L2      {cfg2['adapt_l2']:.6g}f\n",
+         f"#define EMG2_ADAPT_MIN_ACC {cfg2['adapt_min_acc']:.3f}f\n",
+         f"#define EMG2_ADAPT_NEED_ACC {cfg2['adapt_need_acc']:.3f}f\n\n",
          "// 모델이 쓰는 채널 (CSV의 Ch 번호 = 보드의 EMG_PINS 순서)\n",
          f"static const int EMG2_CHANNEL_IDX[EMG2_NUM_CH] = {{ {', '.join(str(c) for c in cfg['channels'])} }};\n",
          f"static const char *const EMG2_CLASS_NAMES[EMG2_NUM_CLASSES] = {{ {quoted} }};\n\n",
@@ -574,6 +677,37 @@ def reference_from_chunk(model, norm, chunk_raw, cfg, cfg2, sos, rest_pow):
     acc = hop_accumulate(filt, cfg2["hop"])
     p = predict_probs(model, norm, compute_features(acc, cfg2, rest_pow))
     return p[-1], float(compute_strength(acc, cfg2, rest_pow)[-1])
+
+
+def rotated_session(s, hop):
+    """채널 순서를 한 칸 돌린 세션 (착용 위치가 달라져 동작별 채널 패턴이 바뀐 상황 흉내)"""
+    r = dict(s)
+    r["raw"] = np.roll(s["raw"], 1, axis=1)
+    r["filt"] = np.roll(s["filt"], 1, axis=1)
+    r.pop(f"acc{hop}", None)
+    return r
+
+
+def adapt_test_vectors(model, norm, sess, cfg, cfg2, rest_pow, n_max=128):
+    """보드 자가 점검용: 착용 위치가 달라진 상황(채널 순서를 돌림)의 보정 녹화 일부와,
+    그것으로 마지막 층을 다시 맞춘 PC 결과 (emg2_adapt_fc가 같은 값을 내는지 확인)"""
+    d = prepare([rotated_session(sess, cfg2["hop"])], cfg, cfg2, rest_pow)[0]
+    idx = np.flatnonzero(cal_frames(d, cfg, cfg2))
+    idx = idx[np.linspace(0, len(idx) - 1, min(n_max, len(idx))).astype(int)]
+    H = embed_sequence(model, norm, d["X"])[idx]
+    Y = d["y"][idx].astype(np.uint8)
+    W, B, acc = adapt_fc(model.fc.weight.detach().numpy(), model.fc.bias.detach().numpy(), H, Y,
+                         len(cfg["class_names"]), cfg2)
+    base_acc = float((predict_probs(model, norm, d["X"]).argmax(axis=1)[idx] == Y).mean())
+    ca = base.c_array
+    return [f"// 사용자 보정(마지막 층 다시 맞추기) 시험: {sess['name']}의 채널 순서를 돌린 보정 녹화 {len(Y)}프레임\n",
+            f"// 원래 모델 정답 {base_acc * 100:.0f}% -> 다시 맞춘 뒤 {acc * 100:.0f}% (PC)\n",
+            f"#define EMG2_TEST_ADAPT_N {len(Y)}\n",
+            f"#define EMG2_TEST_ADAPT_ACC {acc:.6f}f\n",
+            ca("EMG2_TEST_ADAPT_H", H),
+            f"static const uint8_t EMG2_TEST_ADAPT_Y[{len(Y)}] = {{ {', '.join(str(int(v)) for v in Y)} }};\n",
+            ca("EMG2_TEST_ADAPT_W", W),
+            ca("EMG2_TEST_ADAPT_B", B), "\n"]
 
 
 def export_test_vectors(model, norm, sessions, cfg, cfg2, sos, rest_pow, path):
@@ -621,7 +755,9 @@ def export_test_vectors(model, norm, sessions, cfg, cfg2, sos, rest_pow, path):
     h.append(f"static const float EMG2_TEST_EXPECTED_PROB[{len(raws)}][{len(names)}] = {{\n")
     for p in probs:
         h.append("  { " + ", ".join(f"{v:.6f}f" for v in p) + " },\n")
-    h.append("};\n\n#endif\n")
+    h.append("};\n\n")
+    h += adapt_test_vectors(model, norm, sessions[0], cfg, cfg2, rest_pow)
+    h.append("#endif\n")
     with open(path, "w", encoding="utf-8") as f:
         f.write("".join(h))
 
@@ -629,11 +765,35 @@ def export_test_vectors(model, norm, sessions, cfg, cfg2, sos, rest_pow, path):
 # =====================================================================
 # 메인
 # =====================================================================
-def load_sessions(cfg):
+def list_all_sessions(cfg, extra_dirs=()):
+    """기본 data 폴더 + 추가 폴더(각각 Fixed/, Random/)의 세션 목록. 추가 폴더 세션 이름 앞에는 폴더 이름을 붙임"""
+    listed = []
+    for d in [None] + list(extra_dirs):
+        c = cfg if d is None else dict(cfg, fist_dir=os.path.join(d, "Fixed"), random_dir=os.path.join(d, "Random"))
+        src = "data"
+        if d is not None:
+            norm_d = os.path.normpath(os.path.abspath(d))
+            src = os.path.basename(norm_d)
+            if src.lower() == "data":                 # 기본 폴더 이름과 겹치지 않게 상위 폴더 이름을 붙임
+                src = os.path.basename(os.path.dirname(norm_d)) + "/" + src
+        if d is not None and not os.path.isdir(c["fist_dir"]) and not os.path.isdir(c["random_dir"]):
+            raise SystemExit(f"{d} 안에 Fixed 또는 Random 폴더가 없습니다.")
+        for s in base.list_sessions(c):
+            s["src"] = src
+            s["extra"] = d is not None
+            if d is not None:
+                s["name"] = f"{src}/{s['name']}"
+            listed.append(s)
+    return listed
+
+
+def load_sessions(cfg, extra_dirs=(), keep_classes=False):
+    """keep_classes=True면 cfg["class_names"]를 그대로 씀 (이미 학습한 모델로 다른 데이터를 시험할 때)"""
     sos = base.design_sos(cfg)
-    listed = base.list_sessions(cfg)
-    used = {g for s in listed for g in s["order"]}
-    cfg["class_names"] = [c for c in cfg["all_classes"] if c in used]
+    listed = list_all_sessions(cfg, extra_dirs)
+    if not keep_classes:
+        used = {g for s in listed for g in s["order"]}
+        cfg["class_names"] = [c for c in cfg["all_classes"] if c in used]
     sessions = []
     for s in listed:
         loaded = base.load_session(s, cfg, sos)
@@ -672,10 +832,38 @@ def cross_validate(fixed, cfg, cfg2, n_ch, folds=5):
     return evaluate(preds, cfg, cfg2, rf)
 
 
-def run(cfg, cfg2, do_cv=False, export=True):
+def adaptation_report(model, norm, rest_pow, cfg, cfg2, adapt_dir):
+    """학습에 쓰지 않은 다른 착용 상태 데이터(adapt_dir)로 사용자 보정(마지막 층 다시 맞추기) 효과를 확인.
+    첫 고정 순서 세션을 보정 녹화로 쓰고, Random 세션(없으면 나머지 고정 세션)으로 시험"""
+    _, fx, rd = load_sessions(cfg, [adapt_dir], keep_classes=True)
+    fx = [s for s in fx if s["extra"]]
+    rd = [s for s in rd if s["extra"]]
+    if not fx:
+        return [f"({adapt_dir}: 고정 순서 세션이 없어 보정 흉내를 건너뜀)", ""]
+    cal = prepare([fx[0]], cfg, cfg2, rest_pow)[0]
+    test = prepare(rd or fx[1:], cfg, cfg2, rest_pow)
+    if not test:
+        return [f"({adapt_dir}: 시험할 세션이 없어 건너뜀)", ""]
+    sel = cal_frames(cal, cfg, cfg2)
+    need = float((predict_probs(model, norm, cal["X"]).argmax(axis=1)[sel] == cal["y"][sel]).mean())
+    before, after, acc = adaptation_simulation(model, norm, cal, test, cfg, cfg2)
+    applies = need < cfg2["adapt_need_acc"] and acc >= cfg2["adapt_min_acc"]
+    name = os.path.basename(os.path.normpath(adapt_dir))
+    lines = [f"=== 다른 착용 상태({name}) + 사용자 보정 흉내: {fx[0]['name']}로 보정, {len(test)}세션으로 시험 ===",
+             f"지금 모델이 보정 녹화를 맞힌 비율 {need * 100:.0f}% (기준 {cfg2['adapt_need_acc'] * 100:.0f}% 미만이면 보드가 마지막 층을 다시 맞춤)"
+             f" -> {'다시 맞춤' if applies else '다시 맞추지 않음'}"]
+    for title, ev in (("보정 전", before), ("마지막 층 다시 맞춘 뒤", after)):
+        rt = ev["rt"]
+        lines.append(f"  {title}: 정확도 {ev['win_acc'] * 100:.1f}% (동작만 {ev['finger_acc'] * 100:.1f}%), "
+                     f"인식 {rt['detected']}/놓침 {rt['missed']}, 엉뚱한 출력 {rt['false_events']}회, "
+                     f"지연 {rt['emg_on_median'] * 1000:.0f}ms")
+    return lines + [""]
+
+
+def run(cfg, cfg2, do_cv=False, export=True, extra_dirs=(), adapt_dirs=()):
     os.makedirs(cfg2["out_dir"], exist_ok=True)
     print("[1/5] 데이터 읽는 중...")
-    sos, fixed, rand = load_sessions(cfg)
+    sos, fixed, rand = load_sessions(cfg, extra_dirs)
     names = cfg["class_names"]
     n_cls, n_ch = len(names), len(cfg["channels"])
     print(f"  동작 {n_cls}가지: {', '.join(names)} / 고정 순서 {len(fixed)}개, Random {len(rand)}개")
@@ -700,6 +888,14 @@ def run(cfg, cfg2, do_cv=False, export=True):
     test = prepare(rand, cfg, cfg2, rest_pow)
     ev = evaluate([(d, predict_probs(model, norm, d["X"])) for d in test], cfg, cfg2, model.rf)
     lines += report_lines("Random 세션(순서 섞은 데이터, 학습에 쓰지 않음) 시험 결과", ev, cfg, cfg2)
+    srcs = sorted({s["src"] for s in rand})
+    if len(srcs) > 1:                                  # 데이터 폴더(착용 상태)별로도
+        for src in srcs:
+            sub = [d for d in test if d["sess"]["src"] == src]
+            ev_s = evaluate([(d, predict_probs(model, norm, d["X"])) for d in sub], cfg, cfg2, model.rf)
+            lines += report_lines(f"Random 세션 중 {src} 폴더만", ev_s, cfg, cfg2)
+    for d in adapt_dirs:
+        lines += adaptation_report(model, norm, rest_pow, cfg, cfg2, d)
 
     if len(test) >= 2:
         lines.append("=== 전극을 다시 붙인 상황 흉내 (채널별 이득만 바꿈, 경계 구간까지 포함한 프레임 단위 정확도) ===")
@@ -748,6 +944,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--cv", action="store_true", help="고정 순서 세션으로 5겹 교차검증도 실행")
     ap.add_argument("--no-export", action="store_true", help="파일을 저장하지 않고 결과만 출력")
+    ap.add_argument("--extra-data", action="append", default=[], metavar="폴더",
+                    help="학습에 함께 쓸 데이터 폴더 (Fixed/, Random/ 포함). 다른 날·다른 사람 녹화를 합칠 때. 여러 번 쓸 수 있음")
+    ap.add_argument("--adapt-test", action="append", default=[], metavar="폴더",
+                    help="학습에 쓰지 않고 사용자 보정(마지막 층 다시 맞추기) 효과만 확인할 데이터 폴더")
     args = ap.parse_args()
     torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
-    run(copy.deepcopy(base.CFG), copy.deepcopy(CFG2), do_cv=args.cv, export=not args.no_export)
+    run(copy.deepcopy(base.CFG), copy.deepcopy(CFG2), do_cv=args.cv, export=not args.no_export,
+        extra_dirs=args.extra_data, adapt_dirs=args.adapt_test)

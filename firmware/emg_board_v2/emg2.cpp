@@ -57,11 +57,26 @@ void emg2_back_set_gain(Emg2Back *b, const float *gain_off) {
   }
 }
 
+void emg2_back_set_fc(Emg2Back *b, const float *w, const float *bias) {
+  if (w && bias) {
+    memmove(b->fc_w, w, sizeof(b->fc_w));
+    memmove(b->fc_b, bias, sizeof(b->fc_b));
+    b->fc_custom = 1;
+  } else {
+    b->fc_custom = 0;
+  }
+}
+
 void emg2_back_reset(Emg2Back *b) {
   float keep[EMG2_NUM_CH];
+  static float keep_w[EMG2_NUM_CLASSES * EMG2_EMBED], keep_b[EMG2_NUM_CLASSES];
+  const int custom = b->fc_custom;
   memcpy(keep, b->gain_off, sizeof(keep));
+  memcpy(keep_w, b->fc_w, sizeof(keep_w));
+  memcpy(keep_b, b->fc_b, sizeof(keep_b));
   memset(b, 0, sizeof(*b));
   emg2_back_set_gain(b, keep);
+  if (custom) emg2_back_set_fc(b, keep_w, keep_b);
   b->pred = EMG2_REST_CLASS;
 }
 
@@ -137,11 +152,14 @@ int emg2_back_frame(Emg2Back *b, const Emg2Hop *hop) {
   }
 
   // ---- 전결합층 + 확률 ----
+  memcpy(b->embed, x, sizeof(b->embed));
+  const float *fc_w = b->fc_custom ? b->fc_w : EMG2_FC_W;
+  const float *fc_b = b->fc_custom ? b->fc_b : EMG2_FC_B;
   float logits[EMG2_NUM_CLASSES];
   int best = 0;
   for (int k = 0; k < EMG2_NUM_CLASSES; ++k) {
-    float acc = EMG2_FC_B[k];
-    const float *w = EMG2_FC_W + k * EMG2_EMBED;
+    float acc = fc_b[k];
+    const float *w = fc_w + k * EMG2_EMBED;
     for (int j = 0; j < EMG2_EMBED; ++j) acc += w[j] * x[j];
     logits[k] = acc;
     if (acc > logits[best]) best = k;
@@ -224,4 +242,101 @@ int emg2_decide(Emg2Decider *d, const float *probs, float strength) {
     d->sw_run = 0;
   }
   return d->output;
+}
+
+// ---------------------------------------------------------------
+// +) 사용자 보정: 마지막 층 다시 맞추기
+//    손실 = 동작별 가중 교차 엔트로피 (가중치 = sqrt(전체 / (클래스 수 x 그 동작 프레임 수)), 합이 1이 되게)
+//         + EMG2_ADAPT_L2 x |W - W0|^2   (W0 = 학습한 원래 값)
+//    전체 배치 Adam (beta 0.9 / 0.999, eps 1e-8). train_v2.py의 adapt_fc와 같은 식
+// ---------------------------------------------------------------
+#if !defined(EMG2_ADAPT_STEPS) || !defined(EMG2_MODEL_ID)
+#error "emg2_model.h가 예전 버전입니다. python train_v2.py 로 다시 만드세요 (사용자 보정 설정 EMG2_ADAPT_* 필요)"
+#endif
+
+#define EMG2_FC_N (EMG2_NUM_CLASSES * EMG2_EMBED)
+
+float emg2_adapt_fc(const float *H, const uint8_t *Y, int n, float *W, float *B, void (*yield_fn)(void)) {
+  static float mW[EMG2_FC_N], vW[EMG2_FC_N], gW[EMG2_FC_N];
+  float mB[EMG2_NUM_CLASSES], vB[EMG2_NUM_CLASSES], gB[EMG2_NUM_CLASSES];
+  float cw[EMG2_NUM_CLASSES], cnt[EMG2_NUM_CLASSES];
+  const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f, lr = EMG2_ADAPT_LR, l2 = EMG2_ADAPT_L2;
+
+  memcpy(W, EMG2_FC_W, sizeof(float) * EMG2_FC_N);
+  memcpy(B, EMG2_FC_B, sizeof(float) * EMG2_NUM_CLASSES);
+  if (n <= 0) return 0.0f;
+
+  // 동작별 가중치
+  for (int k = 0; k < EMG2_NUM_CLASSES; ++k) cnt[k] = 0.0f;
+  int valid = 0;
+  for (int i = 0; i < n; ++i) if (Y[i] < EMG2_NUM_CLASSES) { cnt[Y[i]] += 1.0f; ++valid; }
+  for (int k = 0; k < EMG2_NUM_CLASSES; ++k)
+    cw[k] = cnt[k] > 0.0f ? sqrtf((float)valid / ((float)EMG2_NUM_CLASSES * cnt[k])) : 0.0f;
+  float wsum = 0.0f;
+  for (int i = 0; i < n; ++i) if (Y[i] < EMG2_NUM_CLASSES) wsum += cw[Y[i]];
+  if (wsum <= 0.0f) return 0.0f;
+
+  memset(mW, 0, sizeof(mW)); memset(vW, 0, sizeof(vW));
+  memset(mB, 0, sizeof(mB)); memset(vB, 0, sizeof(vB));
+  float p1 = 1.0f, p2 = 1.0f;
+  for (int t = 1; t <= EMG2_ADAPT_STEPS; ++t) {
+    memset(gW, 0, sizeof(gW));
+    memset(gB, 0, sizeof(gB));
+    for (int i = 0; i < n; ++i) {
+      const int y = Y[i];
+      if (y >= EMG2_NUM_CLASSES) continue;
+      const float *h = H + (size_t)i * EMG2_EMBED;
+      float z[EMG2_NUM_CLASSES];
+      float zmax = -1e30f;
+      for (int k = 0; k < EMG2_NUM_CLASSES; ++k) {
+        float acc = B[k];
+        const float *w = W + k * EMG2_EMBED;
+        for (int j = 0; j < EMG2_EMBED; ++j) acc += w[j] * h[j];
+        z[k] = acc;
+        if (acc > zmax) zmax = acc;
+      }
+      float sum = 0.0f;
+      for (int k = 0; k < EMG2_NUM_CLASSES; ++k) { z[k] = expf(z[k] - zmax); sum += z[k]; }
+      const float s = cw[y] / wsum;
+      for (int k = 0; k < EMG2_NUM_CLASSES; ++k) {
+        const float g = (z[k] / sum - (k == y ? 1.0f : 0.0f)) * s;
+        gB[k] += g;
+        float *gw = gW + k * EMG2_EMBED;
+        for (int j = 0; j < EMG2_EMBED; ++j) gw[j] += g * h[j];
+      }
+    }
+    p1 *= b1;
+    p2 *= b2;
+    const float c1 = 1.0f - p1, c2 = 1.0f - p2;
+    for (int i = 0; i < EMG2_FC_N; ++i) {
+      const float g = gW[i] + 2.0f * l2 * (W[i] - EMG2_FC_W[i]);
+      mW[i] = b1 * mW[i] + (1.0f - b1) * g;
+      vW[i] = b2 * vW[i] + (1.0f - b2) * g * g;
+      W[i] -= lr * (mW[i] / c1) / (sqrtf(vW[i] / c2) + eps);
+    }
+    for (int k = 0; k < EMG2_NUM_CLASSES; ++k) {
+      const float g = gB[k];
+      mB[k] = b1 * mB[k] + (1.0f - b1) * g;
+      vB[k] = b2 * vB[k] + (1.0f - b2) * g * g;
+      B[k] -= lr * (mB[k] / c1) / (sqrtf(vB[k] / c2) + eps);
+    }
+    if (yield_fn && (t % 16) == 0) yield_fn();
+  }
+
+  // 보정 녹화를 맞힌 비율
+  int correct = 0;
+  for (int i = 0; i < n; ++i) {
+    if (Y[i] >= EMG2_NUM_CLASSES) continue;
+    const float *h = H + (size_t)i * EMG2_EMBED;
+    int best = 0;
+    float bestv = -1e30f;
+    for (int k = 0; k < EMG2_NUM_CLASSES; ++k) {
+      float acc = B[k];
+      const float *w = W + k * EMG2_EMBED;
+      for (int j = 0; j < EMG2_EMBED; ++j) acc += w[j] * h[j];
+      if (acc > bestv) { bestv = acc; best = k; }
+    }
+    correct += (best == Y[i]);
+  }
+  return valid ? (float)correct / (float)valid : 0.0f;
 }
