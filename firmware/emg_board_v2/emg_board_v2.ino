@@ -23,7 +23,7 @@
 //   SW2 3초  : 의수 호밍 (근전도 모드에서, LED 3번 깜빡임)
 // 스위치가 없어도 시리얼 모니터에서 글자를 보내면 됩니다.
 //   1 = SW1, 2 = SW2, h = 호밍, c = 사용자 보정, x = 보정 지우기, l = 잠금 모드, ? = 상태
-//   v = 채널 신호 보기 (누를 때마다 글자 -> 그래프(시리얼 플로터) -> 끔). 전극이 잘 붙었는지 확인할 때
+//   v = 채널 신호 표시 바꾸기 (켜면 1초마다 자동 출력 -> 그래프(시리얼 플로터) -> 끔 -> 다시 1초마다)
 //   (BOOT 버튼: 짧게 = SW2, 0.8초 = SW1)
 //
 // LED (근전도 모드에서 평소에는 꺼져 있음)
@@ -146,9 +146,10 @@ static const MacroItem MACROS[] = {
 // 채널 신호 보기 (시리얼 v)
 //   신호 크기 = 학습 데이터에서 쉴 때의 몇 배인지. 쉬면 1 근처, 힘주면 그 근육 위 채널이 3배 이상 올라가야 정상
 // ---------------------------------------------------------------------
-#define MON_TEXT_FRAMES    10     // 글자 보기: 이 프레임마다 한 줄 (10 = 0.25초)
+#define MON_DEFAULT        1      // 켜자마자: 1 = 1초마다 채널 크기 출력, 0 = 끔 (v로 켬)
+#define MON_TEXT_FRAMES    40     // 글자 보기: 이 프레임마다 한 줄 (40 = 1초)
 #define MON_PLOT_FRAMES    2      // 그래프 보기: 이 프레임마다 한 줄 (2 = 0.05초)
-#define MON_SUMMARY_LINES  20     // 글자 보기: 이 줄마다 채널 점검 요약 (20 = 5초)
+#define MON_SUMMARY_LINES  5      // 글자 보기: 이 줄마다 채널 점검 요약 (5 = 5초)
 #define MON_REST_NOISY     2.0f   // 쉬는 동안 이 배수보다 크면 "쉴 때 잡음 큼"
 #define MON_ACTIVE_MIN     1.5f   // 다른 채널은 3배 넘게 반응했는데 이 배수도 못 넘으면 "반응 없음"
 
@@ -207,7 +208,7 @@ static volatile bool    s_reqHoming = false;  // 스위치 태스크 -> 판단 �
 static volatile bool    s_reqCal = false;
 static volatile bool    s_reqCalReset = false;
 static volatile bool    s_reqStatus = false;
-static volatile uint8_t s_monMode = 0;        // 채널 신호 보기: 0 끔, 1 글자, 2 그래프
+static volatile uint8_t s_monMode = MON_DEFAULT;   // 채널 신호 보기: 0 끔, 1 글자(1초마다), 2 그래프
 static volatile uint32_t s_clipCnt[REC_CH];   // 원본 값이 끝(0 근처/4095 근처)에 붙은 횟수 (측정 루프가 셈)
 static volatile bool    s_calActive = false;
 static volatile bool    s_calLed = false;
@@ -693,7 +694,7 @@ static uint32_t s_statN = 0;
 #if RUN_MODE == MODE_RUN
 // ---------------------------------------------------------------------
 // 채널 신호 보기 (시리얼 v): 판단 태스크에서 25ms마다 호출
-//   글자: 0.25초마다 채널별 신호 크기와 막대, 5초마다 채널 점검 요약
+//   글자: 1초마다 채널별 신호 크기와 막대, 5초마다 채널 점검 요약 (켜자마자 자동)
 //   그래프: Arduino IDE의 시리얼 플로터로 보는 형식 (Ch00:1.2 Ch01:3.4 ...)
 // ---------------------------------------------------------------------
 static void monBar(float r) {
@@ -718,11 +719,11 @@ static void monitorFrame(int pred) {
     }
     if (m == 1) {
       Serial.println("=== 채널 신호 보기 (글자) === 숫자 = 학습 때 쉴 때의 몇 배. 쉬면 1 근처, 힘주면 3배 이상이 정상");
-      Serial.println("    여러 동작을 해 보면 5초마다 채널 점검 요약이 나옵니다. v = 그래프로, 한 번 더 = 끔");
+      Serial.println("    1초마다 한 줄, 5초마다 채널 점검 요약. v = 그래프로 바꾸기, 한 번 더 = 끔");
     } else if (m == 2) {
       Serial.println("=== 채널 신호 보기 (그래프) === Arduino IDE의 도구 -> 시리얼 플로터로 보세요. v = 끔");
     } else {
-      Serial.println("=== 채널 신호 보기 끔 ===");
+      Serial.println("=== 채널 신호 보기 끔 === (v = 다시 켜기)");
     }
   }
   if (!m) return;
@@ -1128,7 +1129,7 @@ void setup() {
 #else
   Serial.println("===== MODE_RUN: 근전도 모드로 시작합니다 =====");
   Serial.println("- 시리얼 키: 1 모드 전환, 2 다음 동작/잠금, h 호밍, c 사용자 보정, x 보정 지우기, l 잠금 모드, ? 상태");
-  Serial.println("- 전극 확인: v 를 보내면 채널별 신호가 계속 나옵니다 (한 번 더 = 그래프, 또 한 번 = 끔)");
+  Serial.println("- 채널별 신호 크기가 1초마다 나옵니다. v = 그래프(시리얼 플로터)로 바꾸기, 한 번 더 = 끔");
 #endif
 #endif
 
