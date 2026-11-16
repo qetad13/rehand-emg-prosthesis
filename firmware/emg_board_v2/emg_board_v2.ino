@@ -23,6 +23,7 @@
 //   SW2 3초  : 의수 호밍 (근전도 모드에서, LED 3번 깜빡임)
 // 스위치가 없어도 시리얼 모니터에서 글자를 보내면 됩니다.
 //   1 = SW1, 2 = SW2, h = 호밍, c = 사용자 보정, x = 보정 지우기, l = 잠금 모드, ? = 상태
+//   v = 채널 신호 보기 (누를 때마다 글자 -> 그래프(시리얼 플로터) -> 끔). 전극이 잘 붙었는지 확인할 때
 //   (BOOT 버튼: 짧게 = SW2, 0.8초 = SW1)
 //
 // LED (근전도 모드에서 평소에는 꺼져 있음)
@@ -142,6 +143,16 @@ static const MacroItem MACROS[] = {
 #define CTRL_MACRO 1   // 매크로 모드
 
 // ---------------------------------------------------------------------
+// 채널 신호 보기 (시리얼 v)
+//   신호 크기 = 학습 데이터에서 쉴 때의 몇 배인지. 쉬면 1 근처, 힘주면 그 근육 위 채널이 3배 이상 올라가야 정상
+// ---------------------------------------------------------------------
+#define MON_TEXT_FRAMES    10     // 글자 보기: 이 프레임마다 한 줄 (10 = 0.25초)
+#define MON_PLOT_FRAMES    2      // 그래프 보기: 이 프레임마다 한 줄 (2 = 0.05초)
+#define MON_SUMMARY_LINES  20     // 글자 보기: 이 줄마다 채널 점검 요약 (20 = 5초)
+#define MON_REST_NOISY     2.0f   // 쉬는 동안 이 배수보다 크면 "쉴 때 잡음 큼"
+#define MON_ACTIVE_MIN     1.5f   // 다른 채널은 3배 넘게 반응했는데 이 배수도 못 넘으면 "반응 없음"
+
+// ---------------------------------------------------------------------
 // 사용자 보정
 //   동작마다: 의수가 동작을 보여줌(LED 켜짐) -> 1.2초 뒤부터 2초 동안 측정 -> 휴식 2초(LED 꺼짐)
 // ---------------------------------------------------------------------
@@ -196,6 +207,8 @@ static volatile bool    s_reqHoming = false;  // 스위치 태스크 -> 판단 �
 static volatile bool    s_reqCal = false;
 static volatile bool    s_reqCalReset = false;
 static volatile bool    s_reqStatus = false;
+static volatile uint8_t s_monMode = 0;        // 채널 신호 보기: 0 끔, 1 글자, 2 그래프
+static volatile uint32_t s_clipCnt[REC_CH];   // 원본 값이 끝(0 근처/4095 근처)에 붙은 횟수 (측정 루프가 셈)
 static volatile bool    s_calActive = false;
 static volatile bool    s_calLed = false;
 static volatile uint8_t s_blinkReq = 0;       // LED를 이 횟수만큼 깜빡여 달라는 요청
@@ -574,7 +587,8 @@ static void ctrlTaskFn(void *arg) {
       else if (ch == 'c' || ch == 'C') onCalRequested();
       else if (ch == 'x' || ch == 'X') s_reqCalReset = true;
       else if (ch == 'l' || ch == 'L') { if (s_ctrlMode == CTRL_EMG) onSw2Short(); }
-      else if (ch == '?') s_reqStatus = true;                    // 줄바꿈 등 다른 글자는 무시
+      else if (ch == '?') s_reqStatus = true;
+      else if (ch == 'v' || ch == 'V') s_monMode = (uint8_t)((s_monMode + 1) % 3);   // 줄바꿈 등 다른 글자는 무시
     }
 #endif
     // SW1: 짧게(뗄 때) = 모드 전환, 3초 = 사용자 보정
@@ -676,6 +690,93 @@ static uint32_t s_clip[REC_CH];
 static uint32_t s_statN = 0;
 #endif
 
+#if RUN_MODE == MODE_RUN
+// ---------------------------------------------------------------------
+// 채널 신호 보기 (시리얼 v): 판단 태스크에서 25ms마다 호출
+//   글자: 0.25초마다 채널별 신호 크기와 막대, 5초마다 채널 점검 요약
+//   그래프: Arduino IDE의 시리얼 플로터로 보는 형식 (Ch00:1.2 Ch01:3.4 ...)
+// ---------------------------------------------------------------------
+static void monBar(float r) {
+  // 1배 = 빈 막대, 30배 = 가득 (로그 눈금)
+  int n = (int)(logf(r > 1.0f ? r : 1.0f) / logf(30.0f) * 10.0f + 0.5f);
+  if (n > 10) n = 10;
+  for (int i = 0; i < 10; ++i) Serial.print(i < n ? '#' : '.');
+}
+
+static void monitorFrame(int pred) {
+  static uint8_t  lastMode = 0;
+  static uint32_t n = 0, lines = 0, restN = 0;
+  static float    sum[EMG2_NUM_CH], restLvl[EMG2_NUM_CH], maxAll[EMG2_NUM_CH];
+  static uint32_t clipLine[EMG2_NUM_CH], clipStart[EMG2_NUM_CH];
+  const uint8_t m = s_monMode;
+  if (m != lastMode) {
+    lastMode = m;
+    n = lines = restN = 0;
+    for (int c = 0; c < EMG2_NUM_CH; ++c) {
+      sum[c] = restLvl[c] = maxAll[c] = 0.0f;
+      clipLine[c] = clipStart[c] = s_clipCnt[EMG2_CHANNEL_IDX[c]];
+    }
+    if (m == 1) {
+      Serial.println("=== 채널 신호 보기 (글자) === 숫자 = 학습 때 쉴 때의 몇 배. 쉬면 1 근처, 힘주면 3배 이상이 정상");
+      Serial.println("    여러 동작을 해 보면 5초마다 채널 점검 요약이 나옵니다. v = 그래프로, 한 번 더 = 끔");
+    } else if (m == 2) {
+      Serial.println("=== 채널 신호 보기 (그래프) === Arduino IDE의 도구 -> 시리얼 플로터로 보세요. v = 끔");
+    } else {
+      Serial.println("=== 채널 신호 보기 끔 ===");
+    }
+  }
+  if (!m) return;
+
+  float r[EMG2_NUM_CH];
+  for (int c = 0; c < EMG2_NUM_CH; ++c) {
+    r[c] = expf(s_back.logamp[c]);
+    sum[c] += r[c];
+    if (r[c] > maxAll[c]) maxAll[c] = r[c];
+    if (pred == EMG2_REST_CLASS) restLvl[c] = restN ? restLvl[c] + 0.05f * (r[c] - restLvl[c]) : r[c];
+  }
+  if (pred == EMG2_REST_CLASS) restN++;
+  n++;
+
+  if (m == 2) {
+    if (n % MON_PLOT_FRAMES == 0) {
+      for (int c = 0; c < EMG2_NUM_CH; ++c)
+        Serial.printf("%sCh%02d:%.2f", c ? " " : "", EMG2_CHANNEL_IDX[c], r[c]);
+      Serial.println();
+    }
+    return;
+  }
+
+  if (n < MON_TEXT_FRAMES) return;
+  for (int c = 0; c < EMG2_NUM_CH; ++c) {
+    const float avg = sum[c] / (float)n;
+    const uint32_t clips = s_clipCnt[EMG2_CHANNEL_IDX[c]];
+    Serial.printf("Ch%02d %5.1f ", EMG2_CHANNEL_IDX[c], avg);
+    monBar(avg);
+    Serial.print(clips != clipLine[c] ? " 포화! " : "  ");
+    clipLine[c] = clips;
+    sum[c] = 0.0f;
+  }
+  Serial.printf("| 판단 %s\n", EMG2_CLASS_NAMES[pred]);
+  n = 0;
+
+  if (++lines < MON_SUMMARY_LINES) return;
+  lines = 0;
+  float best = 0.0f;
+  for (int c = 0; c < EMG2_NUM_CH; ++c) if (maxAll[c] > best) best = maxAll[c];
+  Serial.print("[채널 점검]");
+  for (int c = 0; c < EMG2_NUM_CH; ++c) {
+    const uint32_t clips = s_clipCnt[EMG2_CHANNEL_IDX[c]] - clipStart[c];
+    Serial.printf(" Ch%02d ", EMG2_CHANNEL_IDX[c]);
+    if (clips) Serial.printf("포화 %lu번(배선·전원 확인)", (unsigned long)clips);
+    else if (restN >= 40 && restLvl[c] > MON_REST_NOISY) Serial.printf("쉴 때 잡음 큼 x%.1f(접촉 확인)", restLvl[c]);
+    else if (best > 3.0f && maxAll[c] < MON_ACTIVE_MIN) Serial.printf("반응 없음 최대 x%.1f(위치 확인)", maxAll[c]);
+    else if (best <= 3.0f) Serial.printf("최대 x%.1f(힘을 줘 보세요)", maxAll[c]);
+    else Serial.printf("정상 최대 x%.1f", maxAll[c]);
+    Serial.print(c + 1 < EMG2_NUM_CH ? " /" : "\n");
+  }
+}
+#endif
+
 // ---------------------------------------------------------------------
 // 판단 태스크 (코어 0): 25ms마다 하나씩 오는 누적값으로 판단하고 의수로 보냄
 // ---------------------------------------------------------------------
@@ -745,6 +846,7 @@ static void inferTaskFn(void *arg) {
 #endif
     }
 
+    monitorFrame(pred);
     if (calFrame(frameNo)) {                 // 보정 중에는 평소 판단/전송을 하지 않음
       lastSentCmd = 0;
       prevMode = 0xFF;                       // 끝나면 아래에서 휴식부터 다시 시작
@@ -906,6 +1008,10 @@ static void sampleOnce() {
   }
 #endif
 
+#if RUN_MODE == MODE_RUN
+  for (int c = 0; c < REC_CH; ++c)
+    if (s_lastRaw[c] <= 5 || s_lastRaw[c] >= 4090) s_clipCnt[c] = s_clipCnt[c] + 1;
+#endif
 #if RUN_MODE == MODE_RUN || RUN_MODE == MODE_REPLAY
   float x[EMG2_NUM_CH];
   for (int c = 0; c < EMG2_NUM_CH; ++c) x[c] = (float)v[EMG2_CHANNEL_IDX[c]];
@@ -1022,6 +1128,7 @@ void setup() {
 #else
   Serial.println("===== MODE_RUN: 근전도 모드로 시작합니다 =====");
   Serial.println("- 시리얼 키: 1 모드 전환, 2 다음 동작/잠금, h 호밍, c 사용자 보정, x 보정 지우기, l 잠금 모드, ? 상태");
+  Serial.println("- 전극 확인: v 를 보내면 채널별 신호가 계속 나옵니다 (한 번 더 = 그래프, 또 한 번 = 끔)");
 #endif
 #endif
 
