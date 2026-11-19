@@ -31,6 +31,15 @@
 #define EMG2_SWITCH_FREE_MASK 64   // 휴식 없이 바로 바꿀 수 있는 동작: Fist
 #define EMG2_REST_GATE     1.500f
 
+// 사용자 보정 때 마지막 층 다시 맞추기 (emg2_adapt_fc, train_v2.py의 adapt_fc와 같음)
+#define EMG2_MODEL_ID      0xA5C8387AUL   // 가중치가 바뀌면 달라짐 (저장된 보정이 이 모델 것인지 확인)
+#define EMG2_ADAPT_EVERY   2
+#define EMG2_ADAPT_STEPS   300
+#define EMG2_ADAPT_LR      0.05f
+#define EMG2_ADAPT_L2      0.001f
+#define EMG2_ADAPT_MIN_ACC 0.800f
+#define EMG2_ADAPT_NEED_ACC 0.850f
+
 // 모델이 쓰는 채널 (CSV의 Ch 번호 = 보드의 EMG_PINS 순서)
 static const int EMG2_CHANNEL_IDX[EMG2_NUM_CH] = { 0, 1, 2, 3 };
 static const char *const EMG2_CLASS_NAMES[EMG2_NUM_CLASSES] = { "Rest", "Thumb", "Index", "Middle", "Ring", "Little", "Fist", "Pinch" };

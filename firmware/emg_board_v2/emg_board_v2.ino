@@ -10,7 +10,9 @@
 //      정확도는 올라가고 반응은 빨라지고, 계산은 1회 판단 기준 약 1/50 · 1초 기준 약 1/13 (docs/v2_results.md 참고)
 //   2. 의수와 양방향 연결 (RehandLink.h): 의수의 연결/과열/전압/서보 이상을 LED와 시리얼로 알려 줌
 //   3. 사용자 보정 (SW1 3초): 의수가 동작을 하나씩 보여주면 따라 하기만 하면 됨 (약 40초)
-//      전극을 다시 붙여 채널별 신호 크기가 달라진 것을 맞추고, 동작별 힘 세기 기준도 다시 잡아 저장
+//      전극을 다시 붙여 채널별 신호 크기가 달라진 것을 맞추고, 동작별 힘 세기 기준도 다시 잡아 저장.
+//      착용 위치가 많이 달라졌거나 다른 사람이 쓰는 경우(지금 모델이 보정 녹화를 85% 미만으로 맞힘)에는
+//      보정 녹화로 모델의 마지막 층을 보드에서 다시 맞춤 (1~2초 계산, 녹화 데이터 흉내에서 64% -> 93~96%)
 //   4. 잠금 모드 (근전도 모드에서 SW2 짧게): 한 번 힘주면 그 자세로 유지, 다시 힘주면 풀림
 //      (물건을 오래 쥐고 있을 때 계속 힘주지 않아도 됨)
 //
@@ -21,12 +23,14 @@
 //   SW2 3초  : 의수 호밍 (근전도 모드에서, LED 3번 깜빡임)
 // 스위치가 없어도 시리얼 모니터에서 글자를 보내면 됩니다.
 //   1 = SW1, 2 = SW2, h = 호밍, c = 사용자 보정, x = 보정 지우기, l = 잠금 모드, ? = 상태
+//   v = 채널 신호 표시 바꾸기 (켜면 1초마다 자동 출력 -> 그래프(시리얼 플로터) -> 끔 -> 다시 1초마다)
 //   (BOOT 버튼: 짧게 = SW2, 0.8초 = SW1)
 //
 // LED (근전도 모드에서 평소에는 꺼져 있음)
 //   2초마다 1번 짧게 : 의수와 연결 안 됨 (의수 전원/거리 확인)
 //   2초마다 2번 짧게 : 의수 이상 (과열, 전압 낮음, 서보 응답 없음) -> 시리얼에 원인 출력
 //   보정 중 켜짐     : 의수가 보여주는 동작을 따라 힘주기 / 꺼짐 : 힘 빼기
+//   보정 끝 2번      : 보정 완료 / 6번 : 보정 실패 (예전 보정 유지)
 // =====================================================================
 #include "emg2.h"
 #include "emg2_test_vectors.h"
@@ -139,6 +143,17 @@ static const MacroItem MACROS[] = {
 #define CTRL_MACRO 1   // 매크로 모드
 
 // ---------------------------------------------------------------------
+// 채널 신호 보기 (시리얼 v)
+//   신호 크기 = 학습 데이터에서 쉴 때의 몇 배인지. 쉬면 1 근처, 힘주면 그 근육 위 채널이 3배 이상 올라가야 정상
+// ---------------------------------------------------------------------
+#define MON_DEFAULT        1      // 켜자마자: 1 = 1초마다 채널 크기 출력, 0 = 끔 (v로 켬)
+#define MON_TEXT_FRAMES    40     // 글자 보기: 이 프레임마다 한 줄 (40 = 1초)
+#define MON_PLOT_FRAMES    2      // 그래프 보기: 이 프레임마다 한 줄 (2 = 0.05초)
+#define MON_SUMMARY_LINES  5      // 글자 보기: 이 줄마다 채널 점검 요약 (5 = 5초)
+#define MON_REST_NOISY     2.0f   // 쉬는 동안 이 배수보다 크면 "쉴 때 잡음 큼"
+#define MON_ACTIVE_MIN     1.5f   // 다른 채널은 3배 넘게 반응했는데 이 배수도 못 넘으면 "반응 없음"
+
+// ---------------------------------------------------------------------
 // 사용자 보정
 //   동작마다: 의수가 동작을 보여줌(LED 켜짐) -> 1.2초 뒤부터 2초 동안 측정 -> 휴식 2초(LED 꺼짐)
 // ---------------------------------------------------------------------
@@ -148,13 +163,20 @@ static const MacroItem MACROS[] = {
 #define CAL_MIN_RATIO     1.5f   // 측정한 신호가 쉴 때의 이 배수보다 작으면 그 동작은 실패로 봄
 #define CAL_MIN_GESTURES  4      // 성공한 동작이 이보다 적으면 보정을 적용하지 않음
 #define CAL_MAX_GAIN      0.7f   // 채널별 보정 한계 (로그 값, 0.7 = 약 2배)
-#define CAL_MAGIC         0x32434C52UL
+#define CAL_ADAPT         1      // 1이면 필요할 때 마지막 층을 다시 맞춤 (0이면 예전처럼 채널 크기만 맞춤)
+#define CAL_MAGIC         0x33434C52UL
+// 마지막 층을 다시 맞출 때 쓰는 프레임 수 (동작마다 측정 2초 + 휴식 뒤쪽 1초, EMG2_ADAPT_EVERY 간격)
+#define CAL_ADAPT_MAX     ((EMG2_NUM_CLASSES - 1) * (CAL_RECORD_FRAMES / EMG2_ADAPT_EVERY + \
+                                                     (CAL_REST_FRAMES / 2) / EMG2_ADAPT_EVERY))
 
 struct UserCal {
   uint32_t magic;
-  uint8_t  numCh, numClasses;
+  uint32_t modelId;                    // 보정한 모델 (EMG2_MODEL_ID). 모델을 바꾸면 보정을 다시 해야 함
+  uint8_t  numCh, numClasses, adapted;
   float    gain[EMG2_NUM_CH];          // 채널별 로그 진폭 보정값
   float    full[EMG2_NUM_CLASSES];     // 동작별 힘 세기 100% 기준 (0이면 기본값 사용)
+  float    fc_w[EMG2_NUM_CLASSES * EMG2_EMBED];   // 다시 맞춘 마지막 층 (adapted일 때만)
+  float    fc_b[EMG2_NUM_CLASSES];
 };
 
 // ---------------------------------------------------------------------
@@ -186,6 +208,8 @@ static volatile bool    s_reqHoming = false;  // 스위치 태스크 -> 판단 �
 static volatile bool    s_reqCal = false;
 static volatile bool    s_reqCalReset = false;
 static volatile bool    s_reqStatus = false;
+static volatile uint8_t s_monMode = MON_DEFAULT;   // 채널 신호 보기: 0 끔, 1 글자(1초마다), 2 그래프
+static volatile uint32_t s_clipCnt[REC_CH];   // 원본 값이 끝(0 근처/4095 근처)에 붙은 횟수 (측정 루프가 셈)
 static volatile bool    s_calActive = false;
 static volatile bool    s_calLed = false;
 static volatile uint8_t s_blinkReq = 0;       // LED를 이 횟수만큼 깜빡여 달라는 요청
@@ -195,21 +219,34 @@ static Preferences      s_prefs;
 static void calSetDefault() {
   memset(&s_cal, 0, sizeof(s_cal));
   s_cal.magic = CAL_MAGIC;
+  s_cal.modelId = EMG2_MODEL_ID;
   s_cal.numCh = EMG2_NUM_CH;
   s_cal.numClasses = EMG2_NUM_CLASSES;
 }
 
 static bool calLoad() {
-  UserCal c;
-  s_prefs.begin("emg2", true);
-  const size_t n = s_prefs.getBytes("cal", &c, sizeof(c));
+  static UserCal c;
+  s_prefs.begin("emg2", false);
+  const size_t n = s_prefs.isKey("cal") ? s_prefs.getBytes("cal", &c, sizeof(c)) : 0;
   s_prefs.end();
-  if (n != sizeof(c) || c.magic != CAL_MAGIC || c.numCh != EMG2_NUM_CH || c.numClasses != EMG2_NUM_CLASSES) {
+  if (n == 0) {
+    calSetDefault();
+    return false;
+  }
+  if (n != sizeof(c) || c.magic != CAL_MAGIC || c.numCh != EMG2_NUM_CH || c.numClasses != EMG2_NUM_CLASSES ||
+      c.modelId != EMG2_MODEL_ID) {
+    Serial.println("저장된 사용자 보정이 예전 펌웨어/모델 것이라 쓰지 않습니다. SW1 3초 또는 c 로 다시 보정하세요.");
     calSetDefault();
     return false;
   }
   s_cal = c;
   return true;
+}
+
+// 저장된 보정을 판단에 적용
+static void calApply() {
+  emg2_back_set_gain(&s_back, s_cal.gain);
+  emg2_back_set_fc(&s_back, s_cal.adapted ? s_cal.fc_w : NULL, s_cal.adapted ? s_cal.fc_b : NULL);
 }
 
 static void calSave() {
@@ -253,6 +290,11 @@ struct CalRun {
   float med[EMG2_NUM_CLASSES][EMG2_NUM_CH];       // 동작별 채널별 로그 진폭 중앙값
   bool  ok[EMG2_NUM_CLASSES];
   float noise[EMG2_NUM_CH];                       // 쉴 때 로그 진폭 (0 근처여야 정상) 중 가장 큰 값
+  // 마지막 층 다시 맞추기용: 프레임마다 마지막 층에 들어간 값과 그때 해야 했던 동작
+  float   H[CAL_ADAPT_MAX][EMG2_EMBED];
+  uint8_t Y[CAL_ADAPT_MAX];
+  uint8_t P[CAL_ADAPT_MAX];                       // 지금(원래) 모델의 판단
+  int     nH;
 };
 static CalRun s_calRun;
 
@@ -271,9 +313,23 @@ static int calNextGesture(int g) {
   return -1;
 }
 
+static void calYield() { vTaskDelay(1); }
+
+static void calKeepFrame(int label) {
+  CalRun &r = s_calRun;
+  if (r.nH >= CAL_ADAPT_MAX) return;
+  memcpy(r.H[r.nH], s_back.embed, sizeof(r.H[0]));
+  r.Y[r.nH] = (uint8_t)label;
+  r.P[r.nH] = (uint8_t)s_back.pred;
+  r.nH++;
+}
+
 static void calStart() {
   memset(&s_calRun, 0, sizeof(s_calRun));
   for (int c = 0; c < EMG2_NUM_CH; ++c) s_calRun.noise[c] = -10.0f;
+  // 보정 녹화는 보정 없는 원래 모델로 (다시 맞출 마지막 층은 이 상태를 기준으로 함). 실패하면 예전 보정으로 돌아감
+  emg2_back_set_gain(&s_back, NULL);
+  emg2_back_set_fc(&s_back, NULL, NULL);
   s_calRun.g = calNextGesture(-1);
   s_calActive = true;
   s_calLed = true;
@@ -295,6 +351,7 @@ static void calFinish() {
   if (nOk < CAL_MIN_GESTURES) {
     Serial.printf("=== 보정 실패: 신호가 잡힌 동작이 %d개뿐 (최소 %d개). 예전 보정을 그대로 씁니다 ===\n",
                   nOk, CAL_MIN_GESTURES);
+    calApply();
     s_blinkReq = 6;
     return;
   }
@@ -310,6 +367,38 @@ static void calFinish() {
     if (d < -CAL_MAX_GAIN) d = -CAL_MAX_GAIN;
     s_cal.gain[c] = d;
   }
+
+  // 마지막 층 다시 맞추기: 원래 모델이 보정 녹화를 잘 맞히면(같은 착용 상태) 하지 않음
+  s_cal.adapted = 0;
+  {
+    CalRun &r = s_calRun;
+    int total = 0, correct = 0;
+    for (int i = 0; i < r.nH; ++i) {
+      if (r.Y[i] != EMG2_REST_CLASS && !r.ok[r.Y[i]]) { r.Y[i] = 0xFF; continue; }   // 신호가 안 잡힌 동작은 뺌
+      ++total;
+      correct += (r.P[i] == r.Y[i]);
+    }
+    const float base = total ? (float)correct / (float)total : 1.0f;
+    Serial.printf("[보정] 지금 모델이 보정 녹화를 맞힌 비율 %.0f%% (%d프레임)\n", base * 100.0f, total);
+#if CAL_ADAPT
+    if (base < EMG2_ADAPT_NEED_ACC) {
+      Serial.println("[보정] 착용 상태가 학습 때와 많이 다름 -> 마지막 층을 다시 맞추는 중 (1~2초)...");
+      const uint32_t dropped = s_dropped;
+      const uint32_t t0 = millis();
+      const float acc = emg2_adapt_fc(&r.H[0][0], r.Y, r.nH, s_cal.fc_w, s_cal.fc_b, calYield);
+      s_dropped = dropped;                       // 계산하는 동안 밀린 판단은 세지 않음
+      Serial.printf("[보정] 계산 %lu ms, 보정 녹화를 맞힌 비율 %.0f%% -> %.0f%%\n",
+                    (unsigned long)(millis() - t0), base * 100.0f, acc * 100.0f);
+      if (acc >= EMG2_ADAPT_MIN_ACC) {
+        s_cal.adapted = 1;
+        for (int c = 0; c < EMG2_NUM_CH; ++c) s_cal.gain[c] = 0.0f;   // 다시 맞춘 층은 보정 없는 입력 기준
+      } else {
+        Serial.println("[보정] 다시 맞춰도 정확도가 낮아 적용하지 않음 (전극 접촉 확인 후 다시 보정 권장)");
+      }
+    }
+#endif
+  }
+
   // 동작별 힘 세기 100% 기준: 방금 준 힘
   for (int g = 0; g < EMG2_NUM_CLASSES; ++g) {
     s_cal.full[g] = 0.0f;
@@ -321,9 +410,10 @@ static void calFinish() {
     }
     s_cal.full[g] = best;
   }
-  emg2_back_set_gain(&s_back, s_cal.gain);
+  s_cal.modelId = EMG2_MODEL_ID;
+  calApply();
   calSave();
-  Serial.printf("=== 보정 완료 (%d개 동작 사용) - 저장됨 ===\n", nOk);
+  Serial.printf("=== 보정 완료 (%d개 동작 사용%s) - 저장됨 ===\n", nOk, s_cal.adapted ? ", 마지막 층 다시 맞춤" : "");
   Serial.print("채널별 신호 크기 (학습 때 대비):");
   for (int c = 0; c < EMG2_NUM_CH; ++c) Serial.printf(" Ch %02d x%.2f", EMG2_CHANNEL_IDX[c], expf(s_cal.gain[c]));
   Serial.println();
@@ -345,7 +435,9 @@ static bool calFrame(uint32_t frameNo) {
   }
   if (r.phase == 1) {
     memcpy(r.rec[r.n], s_back.logamp, sizeof(r.rec[0]));
+    if (r.n % EMG2_ADAPT_EVERY == 0) calKeepFrame(r.g);
   } else if (r.phase == 2 && r.n >= CAL_REST_FRAMES / 2) {
+    if ((r.n - CAL_REST_FRAMES / 2) % EMG2_ADAPT_EVERY == 0) calKeepFrame(EMG2_REST_CLASS);
     for (int c = 0; c < EMG2_NUM_CH; ++c) {
       // 휴식 후반부의 프레임 중 가장 조용한 쪽이 아니라 평균적인 수준을 보려고 느리게 따라감
       const float v = s_back.logamp[c];
@@ -496,7 +588,8 @@ static void ctrlTaskFn(void *arg) {
       else if (ch == 'c' || ch == 'C') onCalRequested();
       else if (ch == 'x' || ch == 'X') s_reqCalReset = true;
       else if (ch == 'l' || ch == 'L') { if (s_ctrlMode == CTRL_EMG) onSw2Short(); }
-      else if (ch == '?') s_reqStatus = true;                    // 줄바꿈 등 다른 글자는 무시
+      else if (ch == '?') s_reqStatus = true;
+      else if (ch == 'v' || ch == 'V') s_monMode = (uint8_t)((s_monMode + 1) % 3);   // 줄바꿈 등 다른 글자는 무시
     }
 #endif
     // SW1: 짧게(뗄 때) = 모드 전환, 3초 = 사용자 보정
@@ -598,6 +691,93 @@ static uint32_t s_clip[REC_CH];
 static uint32_t s_statN = 0;
 #endif
 
+#if RUN_MODE == MODE_RUN
+// ---------------------------------------------------------------------
+// 채널 신호 보기 (시리얼 v): 판단 태스크에서 25ms마다 호출
+//   글자: 1초마다 채널별 신호 크기와 막대, 5초마다 채널 점검 요약 (켜자마자 자동)
+//   그래프: Arduino IDE의 시리얼 플로터로 보는 형식 (Ch00:1.2 Ch01:3.4 ...)
+// ---------------------------------------------------------------------
+static void monBar(float r) {
+  // 1배 = 빈 막대, 30배 = 가득 (로그 눈금)
+  int n = (int)(logf(r > 1.0f ? r : 1.0f) / logf(30.0f) * 10.0f + 0.5f);
+  if (n > 10) n = 10;
+  for (int i = 0; i < 10; ++i) Serial.print(i < n ? '#' : '.');
+}
+
+static void monitorFrame(int pred) {
+  static uint8_t  lastMode = 0;
+  static uint32_t n = 0, lines = 0, restN = 0;
+  static float    sum[EMG2_NUM_CH], restLvl[EMG2_NUM_CH], maxAll[EMG2_NUM_CH];
+  static uint32_t clipLine[EMG2_NUM_CH], clipStart[EMG2_NUM_CH];
+  const uint8_t m = s_monMode;
+  if (m != lastMode) {
+    lastMode = m;
+    n = lines = restN = 0;
+    for (int c = 0; c < EMG2_NUM_CH; ++c) {
+      sum[c] = restLvl[c] = maxAll[c] = 0.0f;
+      clipLine[c] = clipStart[c] = s_clipCnt[EMG2_CHANNEL_IDX[c]];
+    }
+    if (m == 1) {
+      Serial.println("=== 채널 신호 보기 (글자) === 숫자 = 학습 때 쉴 때의 몇 배. 쉬면 1 근처, 힘주면 3배 이상이 정상");
+      Serial.println("    1초마다 한 줄, 5초마다 채널 점검 요약. v = 그래프로 바꾸기, 한 번 더 = 끔");
+    } else if (m == 2) {
+      Serial.println("=== 채널 신호 보기 (그래프) === Arduino IDE의 도구 -> 시리얼 플로터로 보세요. v = 끔");
+    } else {
+      Serial.println("=== 채널 신호 보기 끔 === (v = 다시 켜기)");
+    }
+  }
+  if (!m) return;
+
+  float r[EMG2_NUM_CH];
+  for (int c = 0; c < EMG2_NUM_CH; ++c) {
+    r[c] = expf(s_back.logamp[c]);
+    sum[c] += r[c];
+    if (r[c] > maxAll[c]) maxAll[c] = r[c];
+    if (pred == EMG2_REST_CLASS) restLvl[c] = restN ? restLvl[c] + 0.05f * (r[c] - restLvl[c]) : r[c];
+  }
+  if (pred == EMG2_REST_CLASS) restN++;
+  n++;
+
+  if (m == 2) {
+    if (n % MON_PLOT_FRAMES == 0) {
+      for (int c = 0; c < EMG2_NUM_CH; ++c)
+        Serial.printf("%sCh%02d:%.2f", c ? " " : "", EMG2_CHANNEL_IDX[c], r[c]);
+      Serial.println();
+    }
+    return;
+  }
+
+  if (n < MON_TEXT_FRAMES) return;
+  for (int c = 0; c < EMG2_NUM_CH; ++c) {
+    const float avg = sum[c] / (float)n;
+    const uint32_t clips = s_clipCnt[EMG2_CHANNEL_IDX[c]];
+    Serial.printf("Ch%02d %5.1f ", EMG2_CHANNEL_IDX[c], avg);
+    monBar(avg);
+    Serial.print(clips != clipLine[c] ? " 포화! " : "  ");
+    clipLine[c] = clips;
+    sum[c] = 0.0f;
+  }
+  Serial.printf("| 판단 %s\n", EMG2_CLASS_NAMES[pred]);
+  n = 0;
+
+  if (++lines < MON_SUMMARY_LINES) return;
+  lines = 0;
+  float best = 0.0f;
+  for (int c = 0; c < EMG2_NUM_CH; ++c) if (maxAll[c] > best) best = maxAll[c];
+  Serial.print("[채널 점검]");
+  for (int c = 0; c < EMG2_NUM_CH; ++c) {
+    const uint32_t clips = s_clipCnt[EMG2_CHANNEL_IDX[c]] - clipStart[c];
+    Serial.printf(" Ch%02d ", EMG2_CHANNEL_IDX[c]);
+    if (clips) Serial.printf("포화 %lu번(배선·전원 확인)", (unsigned long)clips);
+    else if (restN >= 40 && restLvl[c] > MON_REST_NOISY) Serial.printf("쉴 때 잡음 큼 x%.1f(접촉 확인)", restLvl[c]);
+    else if (best > 3.0f && maxAll[c] < MON_ACTIVE_MIN) Serial.printf("반응 없음 최대 x%.1f(위치 확인)", maxAll[c]);
+    else if (best <= 3.0f) Serial.printf("최대 x%.1f(힘을 줘 보세요)", maxAll[c]);
+    else Serial.printf("정상 최대 x%.1f", maxAll[c]);
+    Serial.print(c + 1 < EMG2_NUM_CH ? " /" : "\n");
+  }
+}
+#endif
+
 // ---------------------------------------------------------------------
 // 판단 태스크 (코어 0): 25ms마다 하나씩 오는 누적값으로 판단하고 의수로 보냄
 // ---------------------------------------------------------------------
@@ -643,7 +823,7 @@ static void inferTaskFn(void *arg) {
       s_reqCalReset = false;
       calSetDefault();
       calSave();
-      emg2_back_set_gain(&s_back, NULL);
+      calApply();
       Serial.println("=== 사용자 보정을 지우고 기본값(학습 데이터 기준)으로 되돌림 ===");
     }
     if (s_reqCal) {
@@ -655,7 +835,7 @@ static void inferTaskFn(void *arg) {
       Serial.printf("[상태] %s 모드, 잠금 %s, 판단 1회 최대 %lu us, 밀린 판단 %lu, 측정 지연 %lu\n",
                     s_ctrlMode == CTRL_MACRO ? "매크로" : "근전도", s_lockMode ? "켬" : "끔",
                     (unsigned long)maxUs, (unsigned long)s_dropped, (unsigned long)s_overruns);
-      Serial.print("  보정(채널별 배율):");
+      Serial.printf("  보정: 마지막 층 %s, 채널별 배율", s_cal.adapted ? "다시 맞춤" : "기본");
       for (int c = 0; c < EMG2_NUM_CH; ++c) Serial.printf(" x%.2f", expf(s_cal.gain[c]));
       Serial.print(" | 지금 신호(쉴 때 대비 배):");
       for (int c = 0; c < EMG2_NUM_CH; ++c) Serial.printf(" %.1f", expf(s_back.logamp[c]));
@@ -667,6 +847,7 @@ static void inferTaskFn(void *arg) {
 #endif
     }
 
+    monitorFrame(pred);
     if (calFrame(frameNo)) {                 // 보정 중에는 평소 판단/전송을 하지 않음
       lastSentCmd = 0;
       prevMode = 0xFF;                       // 끝나면 아래에서 휴식부터 다시 시작
@@ -828,6 +1009,10 @@ static void sampleOnce() {
   }
 #endif
 
+#if RUN_MODE == MODE_RUN
+  for (int c = 0; c < REC_CH; ++c)
+    if (s_lastRaw[c] <= 5 || s_lastRaw[c] >= 4090) s_clipCnt[c] = s_clipCnt[c] + 1;
+#endif
 #if RUN_MODE == MODE_RUN || RUN_MODE == MODE_REPLAY
   float x[EMG2_NUM_CH];
   for (int c = 0; c < EMG2_NUM_CH; ++c) x[c] = (float)v[EMG2_CHANNEL_IDX[c]];
@@ -891,6 +1076,30 @@ static void runSelfTest() {
                 sampleUs / (float)(EMG2_TEST_COUNT * EMG2_TEST_LEN));
   Serial.printf("판단 1회(특징+TCN): 평균 %.0f us, 최대 %lu us  (여유: %d ms마다 1번)\n",
                 frameUs / (float)frames, (unsigned long)frameMax, EMG2_HOP * 1000 / EMG2_FS);
+
+#ifdef EMG2_TEST_ADAPT_N
+  // 사용자 보정의 '마지막 층 다시 맞추기'가 PC(train_v2.py)와 같은 결과를 내는지
+  {
+    static float w[EMG2_NUM_CLASSES * EMG2_EMBED], b[EMG2_NUM_CLASSES];
+    const uint32_t t0 = millis();
+    const float acc = emg2_adapt_fc(EMG2_TEST_ADAPT_H, EMG2_TEST_ADAPT_Y, EMG2_TEST_ADAPT_N, w, b, NULL);
+    const uint32_t ms = millis() - t0;
+    float maxW = 1e-6f, diff = 0.0f;
+    for (int i = 0; i < EMG2_NUM_CLASSES * EMG2_EMBED; ++i) {
+      if (fabsf(EMG2_TEST_ADAPT_W[i]) > maxW) maxW = fabsf(EMG2_TEST_ADAPT_W[i]);
+      if (fabsf(w[i] - EMG2_TEST_ADAPT_W[i]) > diff) diff = fabsf(w[i] - EMG2_TEST_ADAPT_W[i]);
+    }
+    for (int k = 0; k < EMG2_NUM_CLASSES; ++k)
+      if (fabsf(b[k] - EMG2_TEST_ADAPT_B[k]) > diff) diff = fabsf(b[k] - EMG2_TEST_ADAPT_B[k]);
+    const bool ok = diff / maxW < 0.01f && fabsf(acc - EMG2_TEST_ADAPT_ACC) < 1.5f / EMG2_TEST_ADAPT_N;
+    // 실제 보정은 프레임이 더 많음: 동작마다 (측정 2초 + 휴식 1초) / EMG2_ADAPT_EVERY
+    const int full = (EMG2_NUM_CLASSES - 1) * (80 + 40) / EMG2_ADAPT_EVERY;
+    Serial.printf("마지막 층 다시 맞추기: 가중치 차이 %.3f%%, 정답률 보드 %.0f%% / PC %.0f%% | %s\n",
+                  diff / maxW * 100.0f, acc * 100.0f, EMG2_TEST_ADAPT_ACC * 100.0f, ok ? "통과" : "실패");
+    Serial.printf("  계산 %lu ms (%d프레임) -> 실제 보정(%d프레임) 때 약 %.1f초\n", (unsigned long)ms,
+                  EMG2_TEST_ADAPT_N, full, ms * (float)full / EMG2_TEST_ADAPT_N / 1000.0f);
+  }
+#endif
 }
 #endif
 
@@ -920,6 +1129,7 @@ void setup() {
 #else
   Serial.println("===== MODE_RUN: 근전도 모드로 시작합니다 =====");
   Serial.println("- 시리얼 키: 1 모드 전환, 2 다음 동작/잠금, h 호밍, c 사용자 보정, x 보정 지우기, l 잠금 모드, ? 상태");
+  Serial.println("- 채널별 신호 크기가 1초마다 나옵니다. v = 그래프(시리얼 플로터)로 바꾸기, 한 번 더 = 끔");
 #endif
 #endif
 
@@ -937,8 +1147,8 @@ void setup() {
 
 #if RUN_MODE == MODE_RUN
   if (calLoad()) {
-    emg2_back_set_gain(&s_back, s_cal.gain);
-    Serial.print("저장된 사용자 보정 사용 (채널별 배율):");
+    calApply();
+    Serial.printf("저장된 사용자 보정 사용 (마지막 층 %s, 채널별 배율):", s_cal.adapted ? "다시 맞춤" : "기본");
     for (int c = 0; c < EMG2_NUM_CH; ++c) Serial.printf(" x%.2f", expf(s_cal.gain[c]));
     Serial.println();
   } else {

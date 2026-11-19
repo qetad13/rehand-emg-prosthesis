@@ -10,6 +10,8 @@
 //   1) emg2_front_push : 샘플 1개(4채널)를 넣음. 필터 + 누적. 25ms마다 Emg2Hop 하나가 나옴  (1kHz 측정 루프)
 //   2) emg2_back_frame : Emg2Hop -> 특징 -> TCN -> 클래스별 확률, 힘 세기                    (판단 태스크)
 //   3) emg2_decide     : 확률 -> 최종 출력 (켜기/끄기/바꾸기 규칙)                           (판단 태스크)
+//   +) emg2_adapt_fc   : 사용자 보정 녹화로 마지막 층(전결합층)을 보드에서 다시 맞춤
+//                        (착용 위치가 바뀌거나 다른 사람이 쓸 때. 앞의 합성곱층은 그대로)
 // =====================================================================
 #ifndef EMG2_H
 #define EMG2_H
@@ -57,6 +59,9 @@ typedef struct {
   int      pos[EMG2_NUM_LAYERS];
   float    gain_off[EMG2_NUM_CH];                      // 사용자 보정: 채널별 로그 진폭 보정값 (기본 0)
   float    gain_inv[EMG2_NUM_CH];                      // exp(-gain_off)
+  float    fc_w[EMG2_NUM_CLASSES * EMG2_EMBED];        // 사용자 보정으로 다시 맞춘 마지막 층 (fc_custom일 때만 사용)
+  float    fc_b[EMG2_NUM_CLASSES];
+  int      fc_custom;
   uint32_t frames;
 
   // ---- 결과 (emg2_back_frame이 채움) ----
@@ -64,10 +69,13 @@ typedef struct {
   int      pred;                      // 확률이 가장 큰 클래스
   float    strength;                  // 힘 세기: 최근 0.2초 신호 크기가 쉴 때의 몇 배인지 (채널 중 최댓값, 보정 반영)
   float    logamp[EMG2_NUM_CH];       // 채널별 로그 진폭 (쉴 때 = 0, 보정 전 값. 사용자 보정에서 사용)
+  float    embed[EMG2_EMBED];         // 마지막 층에 들어간 값 (사용자 보정에서 사용)
 } Emg2Back;
 
-void emg2_back_reset(Emg2Back *b);                         // 보정값(gain_off)은 그대로 둠
+void emg2_back_reset(Emg2Back *b);                         // 보정값(gain_off, 마지막 층)은 그대로 둠
 void emg2_back_set_gain(Emg2Back *b, const float *gain_off);  // NULL이면 보정 없음(0)
+// 마지막 층 바꾸기: w = [클래스][EMG2_EMBED], bias = [클래스]. NULL이면 학습한 원래 값
+void emg2_back_set_fc(Emg2Back *b, const float *w, const float *bias);
 int  emg2_back_frame(Emg2Back *b, const Emg2Hop *hop);     // pred를 돌려줌
 
 // ---------------------------------------------------------------
@@ -89,6 +97,16 @@ typedef struct {
 
 void emg2_decide_reset(Emg2Decider *d);
 int  emg2_decide(Emg2Decider *d, const float *probs, float strength);
+
+// ---------------------------------------------------------------
+// +) 사용자 보정: 마지막 층 다시 맞추기 (train_v2.py의 adapt_fc와 같은 계산)
+//    H : n개 프레임의 embed 값 [n][EMG2_EMBED],  Y : 각 프레임의 동작 번호
+//    학습한 원래 값에서 시작해 Adam으로 EMG2_ADAPT_STEPS번 (보정에 없는 동작은 원래 값 근처에 머묾)
+//    결과를 w_out [클래스][EMG2_EMBED], b_out [클래스]에 쓰고, 보정 녹화를 맞힌 비율(0~1)을 돌려줌
+//    계산량: n x 클래스 x EMG2_EMBED x 2 x 반복 횟수 (n=380이면 약 6천만 번, ESP32-S3에서 1~2초)
+//    yield_fn: 16번 반복마다 부름 (다른 태스크가 돌 수 있게. 필요 없으면 NULL)
+// ---------------------------------------------------------------
+float emg2_adapt_fc(const float *H, const uint8_t *Y, int n, float *w_out, float *b_out, void (*yield_fn)(void));
 
 #ifdef __cplusplus
 }
